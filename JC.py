@@ -78,25 +78,48 @@ def build_prompt(caption_type: str, caption_length: str | int, extra_options: li
 
 _MODEL_CACHE = {}
 
+def clear_model_cache():
+    """Clears all cached models and frees GPU memory."""
+    global _MODEL_CACHE
+    for cache_key in list(_MODEL_CACHE.keys()):
+        try:
+            cached = _MODEL_CACHE[cache_key]
+            if "model" in cached and cached["model"] is not None:
+                del cached["model"]
+            if "processor" in cached and cached["processor"] is not None:
+                del cached["processor"]
+        except Exception as e:
+            print(f"[JoyCaption] Warning: Error clearing cache entry {cache_key}: {e}")
+    _MODEL_CACHE.clear()
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+    gc.collect()
+    print("[JoyCaption] Model cache cleared")
+
 class JC_Models:
     """Handles loading, caching, and running the LLaVA models."""
-    def __init__(self, model: str, memory_mode: str):
-        cache_key = f"{model}_{memory_mode}"
-        
-        if cache_key in _MODEL_CACHE:
+    def __init__(self, model: str, quantization: str, cache_enabled: bool = False):
+        self.model = None
+        self.processor = None
+        self.device = None
+        self.cache_key = f"{model}_{quantization}"
+        self.cache_enabled = cache_enabled
+
+        if cache_enabled and self.cache_key in _MODEL_CACHE:
             try:
-                self.processor = _MODEL_CACHE[cache_key]["processor"]
-                self.model = _MODEL_CACHE[cache_key]["model"]
-                self.device = _MODEL_CACHE[cache_key]["device"]
-                if not next(self.model.parameters()).is_cuda:
+                self.processor = _MODEL_CACHE[self.cache_key]["processor"]
+                self.model = _MODEL_CACHE[self.cache_key]["model"]
+                self.device = _MODEL_CACHE[self.cache_key]["device"]
+                if self.device == "cuda" and not next(self.model.parameters()).is_cuda:
                     raise RuntimeError("Cached model not on GPU")
-                print(f"Using cached model: {cache_key}")
+                print(f"[JoyCaption] Using cached model: {self.cache_key}")
                 return
             except Exception as e:
-                print(f"Cache validation failed: {e}, reloading model...")
-                if cache_key in _MODEL_CACHE:
-                    del _MODEL_CACHE[cache_key]
+                print(f"[JoyCaption] Cache validation failed: {e}, reloading model...")
+                if self.cache_key in _MODEL_CACHE:
+                    del _MODEL_CACHE[self.cache_key]
                 torch.cuda.empty_cache()
+                gc.collect()
         
         checkpoint_path = Path(folder_paths.models_dir) / "LLM" / Path(model).stem
         if not checkpoint_path.exists():
@@ -139,19 +162,19 @@ class JC_Models:
 
         try:
             if "FP8-Dynamic" in model:
-                print("Loading FP8 model with automatic configuration...")
+                print("[JoyCaption] Loading FP8 model with automatic configuration...")
                 self.model = LlavaForConditionalGeneration.from_pretrained(
                     str(checkpoint_path),
                     torch_dtype="auto",
                     **model_kwargs
                 )
-            elif memory_mode == "Full Precision (bf16)":
+            elif quantization == "Full Precision (bf16)":
                 self.model = LlavaForConditionalGeneration.from_pretrained(
-                    str(checkpoint_path), 
+                    str(checkpoint_path),
                     torch_dtype=torch.bfloat16,
                     **model_kwargs
                 )
-            elif memory_mode == "Balanced (8-bit)":
+            elif quantization == "Balanced (8-bit)":
                 qnt_config = BitsAndBytesConfig(
                     load_in_8bit=True,
                     bnb_8bit_compute_dtype=torch.float16,
@@ -182,57 +205,84 @@ class JC_Models:
                 )
             
             self.model.eval()
-            
+
             if self.device == "cuda" and not next(self.model.parameters()).is_cuda:
                 raise RuntimeError("Model failed to load on GPU")
-            
-            if memory_mode == "Global Cache":
-                _MODEL_CACHE[cache_key] = {
+
+            if self.cache_enabled:
+                _MODEL_CACHE[self.cache_key] = {
                     "processor": self.processor,
                     "model": self.model,
                     "device": self.device
                 }
-                
+                print(f"[JoyCaption] Model cached: {self.cache_key}")
+
         except Exception as e:
-            cleanup_model_resources(self.model, self.processor)
+            self.cleanup()
             handle_model_error(e)
+
+    def cleanup(self):
+        """Release model resources and free GPU memory."""
+        try:
+            if self.model is not None:
+                del self.model
+                self.model = None
+            if self.processor is not None:
+                del self.processor
+                self.processor = None
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+            gc.collect()
+        except Exception as e:
+            print(f"[JoyCaption] Warning during cleanup: {e}")
     
     @torch.inference_mode()
     def generate(self, image: Image.Image, system: str, prompt: str, max_new_tokens: int, temperature: float, top_p: float, top_k: int) -> str:
         """Generates a caption for the given image."""
-        convo = [
-            {"role": "system", "content": system.strip()},
-            {"role": "user", "content": prompt.strip()},
-        ]
+        inputs = None
+        generate_ids = None
+        try:
+            convo = [
+                {"role": "system", "content": system.strip()},
+                {"role": "user", "content": prompt.strip()},
+            ]
 
-        convo_string = self.processor.apply_chat_template(convo, tokenize=False, add_generation_prompt=True)
-        assert isinstance(convo_string, str)
+            convo_string = self.processor.apply_chat_template(convo, tokenize=False, add_generation_prompt=True)
+            assert isinstance(convo_string, str)
 
-        if image.mode != 'RGB':
-            image = image.convert('RGB')
-        
-        image = image.resize(self.target_size, Image.Resampling.LANCZOS)
-        
-        inputs = self.processor(text=[convo_string], images=[image], return_tensors="pt").to(self.device)
-        
-        if hasattr(inputs, 'pixel_values') and inputs['pixel_values'] is not None:
-            inputs['pixel_values'] = inputs['pixel_values'].to(self.model.dtype)
+            if image.mode != 'RGB':
+                image = image.convert('RGB')
 
-        with torch.cuda.amp.autocast(enabled=True):
-            generate_ids = self.model.generate(
-                **inputs,
-                max_new_tokens=max_new_tokens,
-                do_sample=True if temperature > 0 else False,
-                suppress_tokens=None,
-                use_cache=True,
-                temperature=temperature,
-                top_k=None if top_k == 0 else top_k,
-                top_p=top_p,
-            )[0]
+            image = image.resize(self.target_size, Image.Resampling.LANCZOS)
 
-        generate_ids = generate_ids[inputs['input_ids'].shape[1]:]
-        caption = self.processor.tokenizer.decode(generate_ids, skip_special_tokens=True, clean_up_tokenization_spaces=False)
-        return caption.strip()
+            inputs = self.processor(text=[convo_string], images=[image], return_tensors="pt").to(self.device)
+
+            if hasattr(inputs, 'pixel_values') and inputs['pixel_values'] is not None:
+                inputs['pixel_values'] = inputs['pixel_values'].to(self.model.dtype)
+
+            with torch.cuda.amp.autocast(enabled=True):
+                generate_ids = self.model.generate(
+                    **inputs,
+                    max_new_tokens=max_new_tokens,
+                    do_sample=True if temperature > 0 else False,
+                    suppress_tokens=None,
+                    use_cache=True,
+                    temperature=temperature,
+                    top_k=None if top_k == 0 else top_k,
+                    top_p=top_p,
+                )[0]
+
+            generate_ids = generate_ids[inputs['input_ids'].shape[1]:]
+            caption = self.processor.tokenizer.decode(generate_ids, skip_special_tokens=True, clean_up_tokenization_spaces=False)
+            return caption.strip()
+        finally:
+            # Clean up intermediate tensors to prevent memory leaks
+            if inputs is not None:
+                del inputs
+            if generate_ids is not None:
+                del generate_ids
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
 
 class JC_ExtraOptions:
     """A node to collect extra options for captioning."""
@@ -288,22 +338,24 @@ class JC:
     def generate(self, image, model, quantization, prompt_style, caption_length, memory_management, extra_options=None):
         try:
             validate_model_parameters(quantization, list(MEMORY_EFFICIENT_CONFIGS.keys()))
-            
-            if memory_management == "Global Cache":
-                try:
-                    model_name = HF_MODELS[model]["name"]
-                    self.predictor = JC_Models(model_name, quantization)
-                except Exception as e:
-                    return (f"Error loading model: {e}",)
-            elif self.predictor is None or self.current_memory_mode != quantization or self.current_model != model:
+            model_name = HF_MODELS[model]["name"]
+            cache_enabled = (memory_management == "Global Cache")
+
+            # Check if we need to reload the model
+            need_reload = (
+                self.predictor is None or
+                self.current_memory_mode != quantization or
+                self.current_model != model
+            )
+
+            if need_reload:
+                # Clean up existing model before loading new one
                 if self.predictor is not None:
-                    del self.predictor
+                    self.predictor.cleanup()
                     self.predictor = None
-                    torch.cuda.empty_cache()
-                    gc.collect()
+
                 try:
-                    model_name = HF_MODELS[model]["name"]
-                    self.predictor = JC_Models(model_name, quantization)
+                    self.predictor = JC_Models(model_name, quantization, cache_enabled=cache_enabled)
                     self.current_memory_mode = quantization
                     self.current_model = model
                 except Exception as e:
@@ -312,7 +364,7 @@ class JC:
             prompt = build_prompt(prompt_style, caption_length, extra_options[0] if extra_options else [], extra_options[1] if extra_options else "{NAME}")
             system_prompt = MODEL_SETTINGS["default_system_prompt"]
             pil_image = ToPILImage()(image[0].permute(2, 0, 1))
-            
+
             response = self.predictor.generate(
                 image=pil_image,
                 system=system_prompt,
@@ -323,19 +375,21 @@ class JC:
                 top_k=MODEL_SETTINGS["default_top_k"],
             )
 
+            # Clean up after run if requested
             if memory_management == "Clear After Run":
-                del self.predictor
+                self.predictor.cleanup()
                 self.predictor = None
-                torch.cuda.empty_cache()
-                gc.collect()
+                self.current_memory_mode = None
+                self.current_model = None
 
             return (response,)
         except Exception as e:
-            if memory_management == "Clear After Run":
-                del self.predictor
+            # Always clean up on error if Clear After Run is set
+            if memory_management == "Clear After Run" and self.predictor is not None:
+                self.predictor.cleanup()
                 self.predictor = None
-                torch.cuda.empty_cache()
-                gc.collect()
+                self.current_memory_mode = None
+                self.current_model = None
             raise e
 
 class JC_adv:
@@ -375,22 +429,24 @@ class JC_adv:
     def generate(self, image, model, quantization, prompt_style, caption_length, max_new_tokens, temperature, top_p, top_k, custom_prompt, memory_management, extra_options=None):
         try:
             validate_model_parameters(quantization, list(MEMORY_EFFICIENT_CONFIGS.keys()))
-            
-            if memory_management == "Global Cache":
-                try:
-                    model_name = HF_MODELS[model]["name"]
-                    self.predictor = JC_Models(model_name, quantization)
-                except Exception as e:
-                    return (f"Error loading model: {e}", "")
-            elif self.predictor is None or self.current_memory_mode != quantization or self.current_model != model:
+            model_name = HF_MODELS[model]["name"]
+            cache_enabled = (memory_management == "Global Cache")
+
+            # Check if we need to reload the model
+            need_reload = (
+                self.predictor is None or
+                self.current_memory_mode != quantization or
+                self.current_model != model
+            )
+
+            if need_reload:
+                # Clean up existing model before loading new one
                 if self.predictor is not None:
-                    del self.predictor
+                    self.predictor.cleanup()
                     self.predictor = None
-                    torch.cuda.empty_cache()
-                    gc.collect()
+
                 try:
-                    model_name = HF_MODELS[model]["name"]
-                    self.predictor = JC_Models(model_name, quantization)
+                    self.predictor = JC_Models(model_name, quantization, cache_enabled=cache_enabled)
                     self.current_memory_mode = quantization
                     self.current_model = model
                 except Exception as e:
@@ -400,10 +456,10 @@ class JC_adv:
                 prompt = custom_prompt.strip()
             else:
                 prompt = build_prompt(prompt_style, caption_length, extra_options[0] if extra_options else [], extra_options[1] if extra_options else "{NAME}")
-            
+
             system_prompt = MODEL_SETTINGS["default_system_prompt"]
             pil_image = ToPILImage()(image[0].permute(2, 0, 1))
-            
+
             response = self.predictor.generate(
                 image=pil_image,
                 system=system_prompt,
@@ -414,19 +470,21 @@ class JC_adv:
                 top_k=top_k,
             )
 
+            # Clean up after run if requested
             if memory_management == "Clear After Run":
-                del self.predictor
+                self.predictor.cleanup()
                 self.predictor = None
-                torch.cuda.empty_cache()
-                gc.collect()
+                self.current_memory_mode = None
+                self.current_model = None
 
             return (prompt, response)
         except Exception as e:
-            if memory_management == "Clear After Run":
-                del self.predictor
+            # Always clean up on error if Clear After Run is set
+            if memory_management == "Clear After Run" and self.predictor is not None:
+                self.predictor.cleanup()
                 self.predictor = None
-                torch.cuda.empty_cache()
-                gc.collect()
+                self.current_memory_mode = None
+                self.current_model = None
             raise e
 
 NODE_CLASS_MAPPINGS = {

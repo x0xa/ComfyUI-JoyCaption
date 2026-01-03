@@ -69,6 +69,22 @@ else:
 
 _MODEL_CACHE = {}
 
+def clear_model_cache():
+    """Clears all cached GGUF models and frees memory."""
+    global _MODEL_CACHE
+    for cache_key in list(_MODEL_CACHE.keys()):
+        try:
+            cached = _MODEL_CACHE[cache_key]
+            if cached is not None and hasattr(cached, 'cleanup'):
+                cached.cleanup()
+        except Exception as e:
+            print(f"[JoyCaption GGUF] Warning: Error clearing cache entry {cache_key}: {e}")
+    _MODEL_CACHE.clear()
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+    gc.collect()
+    print("[JoyCaption GGUF] Model cache cleared")
+
 def build_prompt(caption_type: str, caption_length: str | int, extra_options: list[str], name_input: str) -> str:
     if caption_length == "any":
         map_idx = 0
@@ -84,6 +100,7 @@ def build_prompt(caption_type: str, caption_length: str | int, extra_options: li
 
 class JC_GGUF_Models:
     def __init__(self, model: str, processing_mode: str):
+        self.model = None
         try:
             models_dir = Path(folder_paths.models_dir).resolve()
             llm_models_dir = (models_dir / "LLM" / "GGUF").resolve()
@@ -201,6 +218,24 @@ class JC_GGUF_Models:
         """Create chat completion with suppressed output"""
         return self.model.create_chat_completion(**completion_params)
 
+    def cleanup(self):
+        """Release model resources and free memory."""
+        try:
+            if self.model is not None:
+                # llama_cpp models have a close method
+                if hasattr(self.model, 'close'):
+                    self.model.close()
+                # Also try to delete the chat_handler which holds the CLIP model
+                if hasattr(self.model, 'chat_handler') and self.model.chat_handler is not None:
+                    del self.model.chat_handler
+                del self.model
+                self.model = None
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+            gc.collect()
+        except Exception as e:
+            print(f"[JoyCaption GGUF] Warning during cleanup: {e}")
+
 class JC_GGUF:
     @classmethod
     def INPUT_TYPES(cls):
@@ -231,35 +266,43 @@ class JC_GGUF:
     
     def generate(self, image, model, processing_mode, prompt_style, caption_length, memory_management, extra_options=None):
         try:
-            print(f"JoyCaption GGUF: Processing image with {model} ({processing_mode} mode)")
+            print(f"[JoyCaption GGUF] Processing image with {model} ({processing_mode} mode)")
             cache_key = f"{model}_{processing_mode}"
-            
-            if memory_management == "Global Cache":
-                try:
-                    if cache_key in _MODEL_CACHE:
-                        self.predictor = _MODEL_CACHE[cache_key]
-                    else:
+            cache_enabled = (memory_management == "Global Cache")
+
+            # Check if we need to reload the model
+            need_reload = (
+                self.predictor is None or
+                self.current_processing_mode != processing_mode or
+                self.current_model != model
+            )
+
+            if need_reload:
+                # Clean up existing model before loading new one
+                if self.predictor is not None:
+                    self.predictor.cleanup()
+                    self.predictor = None
+
+                # Check global cache first if caching is enabled
+                if cache_enabled and cache_key in _MODEL_CACHE:
+                    self.predictor = _MODEL_CACHE[cache_key]
+                    print(f"[JoyCaption GGUF] Using cached model: {cache_key}")
+                else:
+                    try:
                         model_name = GGUF_MODELS[model]["name"]
                         self.predictor = JC_GGUF_Models(model_name, processing_mode)
-                        _MODEL_CACHE[cache_key] = self.predictor
-                except Exception as e:
-                    return (f"Error loading model: {e}",)
-            elif self.predictor is None or self.current_processing_mode != processing_mode or self.current_model != model:
-                if self.predictor is not None:
-                    del self.predictor
-                    self.predictor = None
-                    torch.cuda.empty_cache()
-                try:
-                    model_name = GGUF_MODELS[model]["name"]
-                    self.predictor = JC_GGUF_Models(model_name, processing_mode)
-                    self.current_processing_mode = processing_mode
-                    self.current_model = model
-                except Exception as e:
-                    return (f"Error loading model: {e}",)
+                        if cache_enabled:
+                            _MODEL_CACHE[cache_key] = self.predictor
+                            print(f"[JoyCaption GGUF] Model cached: {cache_key}")
+                    except Exception as e:
+                        return (f"Error loading model: {e}",)
+
+                self.current_processing_mode = processing_mode
+                self.current_model = model
 
             prompt_text = build_prompt(prompt_style, caption_length, extra_options[0] if extra_options else [], extra_options[1] if extra_options else "{NAME}")
 
-            print("JoyCaption GGUF: Generating caption...")
+            print("[JoyCaption GGUF] Generating caption...")
             with torch.inference_mode():
                 pil_image = ToPILImage()(image[0].permute(2, 0, 1))
                 response = self.predictor.generate(
@@ -271,21 +314,23 @@ class JC_GGUF:
                     top_p=MODEL_SETTINGS["default_top_p"],
                     top_k=MODEL_SETTINGS["default_top_k"],
                 )
-            print("JoyCaption GGUF: Caption generation completed")
+            print("[JoyCaption GGUF] Caption generation completed")
 
+            # Clean up after run if requested
             if memory_management == "Clear After Run":
-                del self.predictor
+                self.predictor.cleanup()
                 self.predictor = None
-                torch.cuda.empty_cache()
-                gc.collect()
+                self.current_processing_mode = None
+                self.current_model = None
 
             return (response,)
         except Exception as e:
-            if memory_management == "Clear After Run":
-                del self.predictor
+            # Always clean up on error if Clear After Run is set
+            if memory_management == "Clear After Run" and self.predictor is not None:
+                self.predictor.cleanup()
                 self.predictor = None
-                torch.cuda.empty_cache()
-                gc.collect()
+                self.current_processing_mode = None
+                self.current_model = None
             raise e
 
 class JC_GGUF_adv:
@@ -324,33 +369,41 @@ class JC_GGUF_adv:
     def generate(self, image, model, processing_mode, prompt_style, caption_length, max_new_tokens, temperature, top_p, top_k, custom_prompt, memory_management, extra_options=None):
         try:
             cache_key = f"{model}_{processing_mode}"
-            
-            if memory_management == "Global Cache":
-                try:
-                    if cache_key in _MODEL_CACHE:
-                        self.predictor = _MODEL_CACHE[cache_key]
-                    else:
+            cache_enabled = (memory_management == "Global Cache")
+
+            # Check if we need to reload the model
+            need_reload = (
+                self.predictor is None or
+                self.current_processing_mode != processing_mode or
+                self.current_model != model
+            )
+
+            if need_reload:
+                # Clean up existing model before loading new one
+                if self.predictor is not None:
+                    self.predictor.cleanup()
+                    self.predictor = None
+
+                # Check global cache first if caching is enabled
+                if cache_enabled and cache_key in _MODEL_CACHE:
+                    self.predictor = _MODEL_CACHE[cache_key]
+                    print(f"[JoyCaption GGUF] Using cached model: {cache_key}")
+                else:
+                    try:
                         model_name = GGUF_MODELS[model]["name"]
                         self.predictor = JC_GGUF_Models(model_name, processing_mode)
-                        _MODEL_CACHE[cache_key] = self.predictor
-                except Exception as e:
-                    return ("", f"Error loading model: {e}")
-            elif self.predictor is None or self.current_processing_mode != processing_mode or self.current_model != model:
-                if self.predictor is not None:
-                    del self.predictor
-                    self.predictor = None
-                    torch.cuda.empty_cache()
-                try:
-                    model_name = GGUF_MODELS[model]["name"]
-                    self.predictor = JC_GGUF_Models(model_name, processing_mode)
-                    self.current_processing_mode = processing_mode
-                    self.current_model = model
-                except Exception as e:
-                    return ("", f"Error loading model: {e}")
+                        if cache_enabled:
+                            _MODEL_CACHE[cache_key] = self.predictor
+                            print(f"[JoyCaption GGUF] Model cached: {cache_key}")
+                    except Exception as e:
+                        return ("", f"Error loading model: {e}")
+
+                self.current_processing_mode = processing_mode
+                self.current_model = model
 
             prompt = custom_prompt if custom_prompt.strip() else build_prompt(prompt_style, caption_length, extra_options[0] if extra_options else [], extra_options[1] if extra_options else "{NAME}")
             system_prompt = MODEL_SETTINGS["default_system_prompt"]
-            
+
             pil_image = ToPILImage()(image[0].permute(2, 0, 1))
             response = self.predictor.generate(
                 image=pil_image,
@@ -362,19 +415,21 @@ class JC_GGUF_adv:
                 top_k=top_k,
             )
 
+            # Clean up after run if requested
             if memory_management == "Clear After Run":
-                del self.predictor
+                self.predictor.cleanup()
                 self.predictor = None
-                torch.cuda.empty_cache()
-                gc.collect()
+                self.current_processing_mode = None
+                self.current_model = None
 
             return (prompt, response)
         except Exception as e:
-            if memory_management == "Clear After Run":
-                del self.predictor
+            # Always clean up on error if Clear After Run is set
+            if memory_management == "Clear After Run" and self.predictor is not None:
+                self.predictor.cleanup()
                 self.predictor = None
-                torch.cuda.empty_cache()
-                gc.collect()
+                self.current_processing_mode = None
+                self.current_model = None
             return ("", f"Error: {str(e)}")
 
 NODE_CLASS_MAPPINGS = {
