@@ -101,6 +101,7 @@ def build_prompt(caption_type: str, caption_length: str | int, extra_options: li
 class JC_GGUF_Models:
     def __init__(self, model: str, processing_mode: str):
         self.model = None
+        self.chat_handler = None  # Keep separate reference for cleanup
         try:
             models_dir = Path(folder_paths.models_dir).resolve()
             llm_models_dir = (models_dir / "LLM" / "GGUF").resolve()
@@ -140,35 +141,37 @@ class JC_GGUF_Models:
             else:  # CPU
                 n_gpu_layers = 0
             
-            self.model = self._initialize_model(local_path, mmproj_path, n_ctx, n_batch, n_threads, n_gpu_layers)
-            
+            self.chat_handler, self.model = self._initialize_model(local_path, mmproj_path, n_ctx, n_batch, n_threads, n_gpu_layers)
+
         except Exception as e:
             raise ModelLoadError(f"Model initialization failed: {str(e)}")
     
     @suppress_output
     def _initialize_model(self, local_path, mmproj_path, n_ctx, n_batch, n_threads, n_gpu_layers):
         """Initialize the GGUF model with suppressed output"""
-        return Llama(
+        chat_handler = Llava15ChatHandler(clip_model_path=str(mmproj_path))
+        model = Llama(
             model_path=str(local_path),
             n_ctx=n_ctx,
             n_batch=n_batch,
             n_threads=n_threads,
             n_gpu_layers=n_gpu_layers,
             verbose=False,
-            chat_handler=Llava15ChatHandler(clip_model_path=str(mmproj_path)),
+            chat_handler=chat_handler,
             offload_kqv=True,
             numa=True
         )
+        return chat_handler, model
     
     def generate(self, image: Image.Image, system: str, prompt: str, max_new_tokens: int, temperature: float, top_p: float, top_k: int) -> str:
+        img_buffer = None
+        messages = None
+        response = None
         try:
             if image.mode != 'RGB':
                 image = image.convert('RGB')
-            
+
             image = image.resize(GGUF_SETTINGS["default_image_size"], Image.Resampling.BILINEAR)
-            
-            import io
-            import base64
 
             img_buffer = io.BytesIO()
             image.save(img_buffer, format='PNG')
@@ -203,14 +206,20 @@ class JC_GGUF_Models:
                 completion_params["top_k"] = top_k
 
             response = self._create_completion(completion_params)
-            
-            del messages
-            
-            return response["choices"][0]["message"]["content"].strip()
-            
+            result = response["choices"][0]["message"]["content"].strip()
+            return result
+
         except Exception as e:
             return f"Generation error: {str(e)}"
         finally:
+            # Clean up intermediate data to prevent memory buildup
+            if img_buffer is not None:
+                img_buffer.close()
+                del img_buffer
+            if messages is not None:
+                del messages
+            if response is not None:
+                del response
             gc.collect()
     
     @suppress_output
@@ -221,20 +230,64 @@ class JC_GGUF_Models:
     def cleanup(self):
         """Release model resources and free memory."""
         try:
+            # First, free the CLIP model from chat_handler (this is the main memory leak!)
+            # Use our saved reference which is more reliable
+            chat_handler = self.chat_handler
+            if chat_handler is None and self.model is not None and hasattr(self.model, 'chat_handler'):
+                chat_handler = self.model.chat_handler
+
+            if chat_handler is not None:
+                # Explicitly free CLIP context if available
+                if hasattr(chat_handler, 'clip_ctx') and chat_handler.clip_ctx is not None:
+                    try:
+                        if hasattr(chat_handler, '_clip_free') and chat_handler._clip_free is not None:
+                            chat_handler._clip_free(chat_handler.clip_ctx)
+                            print("[JoyCaption GGUF] CLIP model freed via _clip_free")
+                        elif hasattr(chat_handler, '_llava_cpp') and chat_handler._llava_cpp is not None:
+                            chat_handler._llava_cpp.clip_free(chat_handler.clip_ctx)
+                            print("[JoyCaption GGUF] CLIP model freed via _llava_cpp.clip_free")
+                    except Exception as e:
+                        print(f"[JoyCaption GGUF] Warning: Could not free CLIP context: {e}")
+                    chat_handler.clip_ctx = None
+
+                # Clear chat_handler references
+                if self.model is not None and hasattr(self.model, 'chat_handler'):
+                    self.model.chat_handler = None
+                self.chat_handler = None
+                del chat_handler
+
             if self.model is not None:
-                # llama_cpp models have a close method
+                # Close the main Llama model
                 if hasattr(self.model, 'close'):
                     self.model.close()
-                # Also try to delete the chat_handler which holds the CLIP model
-                if hasattr(self.model, 'chat_handler') and self.model.chat_handler is not None:
-                    del self.model.chat_handler
+                    print("[JoyCaption GGUF] Llama model closed")
+
+                # Clear any remaining references
+                if hasattr(self.model, '_model') and self.model._model is not None:
+                    self.model._model = None
+
                 del self.model
                 self.model = None
+
+            # Force garbage collection multiple times to ensure cleanup
+            gc.collect()
+            gc.collect()
+
             if torch.cuda.is_available():
                 torch.cuda.empty_cache()
+                torch.cuda.synchronize()
+
             gc.collect()
+            print("[JoyCaption GGUF] Cleanup completed")
+
         except Exception as e:
             print(f"[JoyCaption GGUF] Warning during cleanup: {e}")
+            # Try to force cleanup even on error
+            self.model = None
+            self.chat_handler = None
+            gc.collect()
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
 
 class JC_GGUF:
     @classmethod
