@@ -196,7 +196,7 @@ class JC_GGUF_Models:
                 "max_tokens": max_new_tokens,
                 "temperature": temperature,
                 "top_p": top_p,
-                "stop": ["</s>", "User:", "Assistant:"],
+                "stop": ["</s>", "User:", "Assistant:", "USER:", "ASSISTANT:", "\nUser:", "\nAssistant:", "\nUSER:", "\nASSISTANT:"],
                 "stream": False,
                 "repeat_penalty": 1.1,
                 "mirostat_mode": 0
