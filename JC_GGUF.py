@@ -92,7 +92,7 @@ def build_prompt(caption_type: str, caption_length: str | int, extra_options: li
         map_idx = 1
     else:
         map_idx = 2
-    
+
     prompt = CAPTION_TYPE_MAP[caption_type][map_idx]
     if extra_options:
         prompt += " " + " ".join(extra_options)
@@ -106,10 +106,10 @@ class JC_GGUF_Models:
             models_dir = Path(folder_paths.models_dir).resolve()
             llm_models_dir = (models_dir / "LLM" / "GGUF").resolve()
             llm_models_dir.mkdir(parents=True, exist_ok=True)
-            
+
             model_filename = Path(model).name
             local_path = llm_models_dir / model_filename
-            
+
             if not local_path.exists():
                 if "/" not in model:
                     raise ValueError("Invalid model path")
@@ -120,7 +120,7 @@ class JC_GGUF_Models:
                     local_dir=str(llm_models_dir),
                     local_dir_use_symlinks=False
                 )).resolve()
-            
+
             mmproj_filename = GGUF_SETTINGS["mmproj_filename"]
             mmproj_path = llm_models_dir / mmproj_filename
             if not mmproj_path.exists():
@@ -130,7 +130,7 @@ class JC_GGUF_Models:
                     local_dir=str(llm_models_dir),
                     local_dir_use_symlinks=False
                 )).resolve()
-            
+
             n_ctx = MODEL_SETTINGS["context_window"]
             n_batch = 2048
             n_threads = max(4, MODEL_SETTINGS["cpu_threads"])
@@ -140,12 +140,12 @@ class JC_GGUF_Models:
                 n_gpu_layers = -1
             else:  # CPU
                 n_gpu_layers = 0
-            
+
             self.chat_handler, self.model = self._initialize_model(local_path, mmproj_path, n_ctx, n_batch, n_threads, n_gpu_layers)
 
         except Exception as e:
             raise ModelLoadError(f"Model initialization failed: {str(e)}")
-    
+
     @suppress_output
     def _initialize_model(self, local_path, mmproj_path, n_ctx, n_batch, n_threads, n_gpu_layers):
         """Initialize the GGUF model with suppressed output"""
@@ -162,7 +162,7 @@ class JC_GGUF_Models:
             numa=True
         )
         return chat_handler, model
-    
+
     def generate(self, image: Image.Image, system: str, prompt: str, max_new_tokens: int, temperature: float, top_p: float, top_k: int) -> str:
         img_buffer = None
         messages = None
@@ -196,7 +196,7 @@ class JC_GGUF_Models:
                 "max_tokens": max_new_tokens,
                 "temperature": temperature,
                 "top_p": top_p,
-                "stop": ["</s>", "User:", "Assistant:", "USER:", "ASSISTANT:", "\nUser:", "\nAssistant:", "\nUSER:", "\nASSISTANT:"],
+                "stop": ["</s>", "User:", "Assistant:", "USER:", "ASSISTANT:", "\nUser:", "\nAssistant:", "\nUSER:", "\nASSISTANT:", "ASISTANT\n", "ASISTANT:", "ASSENT", "ASSENTED"],
                 "stream": False,
                 "repeat_penalty": 1.1,
                 "mirostat_mode": 0
@@ -221,7 +221,7 @@ class JC_GGUF_Models:
             if response is not None:
                 del response
             gc.collect()
-    
+
     @suppress_output
     def _create_completion(self, completion_params):
         """Create chat completion with suppressed output"""
@@ -316,7 +316,7 @@ class JC_GGUF:
         self.predictor = None
         self.current_processing_mode = None
         self.current_model = None
-    
+
     def generate(self, image, model, processing_mode, prompt_style, caption_length, memory_management, extra_options=None):
         try:
             print(f"[JoyCaption GGUF] Processing image with {model} ({processing_mode} mode)")
@@ -418,7 +418,7 @@ class JC_GGUF_adv:
         self.predictor = None
         self.current_processing_mode = None
         self.current_model = None
-    
+
     def generate(self, image, model, processing_mode, prompt_style, caption_length, max_new_tokens, temperature, top_p, top_k, custom_prompt, memory_management, extra_options=None):
         try:
             cache_key = f"{model}_{processing_mode}"
