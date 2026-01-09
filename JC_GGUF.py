@@ -396,6 +396,11 @@ class JC_GGUF_Models_Subprocess:
 
 class JC_GGUF:
     @classmethod
+    def IS_CHANGED(cls, **kwargs):
+        # Always return NaN to force re-execution (no caching)
+        return float("NaN")
+
+    @classmethod
     def INPUT_TYPES(cls):
         model_list = list(GGUF_MODELS.keys())
         return {
@@ -497,6 +502,11 @@ class JC_GGUF:
             raise e
 
 class JC_GGUF_adv:
+    @classmethod
+    def IS_CHANGED(cls, **kwargs):
+        # Always return NaN to force re-execution (no caching)
+        return float("NaN")
+
     @classmethod
     def INPUT_TYPES(cls):
         model_list = list(GGUF_MODELS.keys())
