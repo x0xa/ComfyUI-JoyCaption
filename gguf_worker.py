@@ -1,50 +1,45 @@
 """
 GGUF Worker Process - runs model in isolated process for guaranteed memory cleanup.
 When process terminates, OS releases ALL its memory including CUDA.
+
+This module can be run as a standalone script for subprocess isolation.
 """
-import multiprocessing as mp
+import sys
+import os
 import io
+import json
 import base64
 import gc
-import os
-import sys
 from pathlib import Path
 
 # Suppress output during import
 os.environ['TRANSFORMERS_VERBOSITY'] = 'error'
 os.environ['TOKENIZERS_PARALLELISM'] = 'false'
 
-# Get module directory for subprocess path setup
-_MODULE_DIR = str(Path(__file__).parent.resolve())
 
-
-def _worker_main(cmd_queue: mp.Queue, result_queue: mp.Queue, model_path: str, mmproj_path: str,
-                 n_ctx: int, n_batch: int, n_threads: int, n_gpu_layers: int, module_dir: str):
+def run_worker(config: dict):
     """
     Main worker function that runs in isolated process.
-    Loads model once, processes requests until told to stop.
+    Loads model once, processes requests until stdin closes.
+
+    Communication protocol (JSON lines over stdin/stdout):
+    - Input: {"action": "generate", ...} or {"action": "stop"}
+    - Output: {"status": "ready"}, {"status": "success", "result": "..."}, {"status": "error", "error": "..."}
     """
-    import traceback
+    import torch
+    from llama_cpp import Llama
+    from llama_cpp.llama_chat_format import Llava15ChatHandler
+    from PIL import Image
 
-    print("[GGUF Worker] Process started", flush=True)
+    def send_response(data: dict):
+        """Send JSON response to parent process."""
+        print(json.dumps(data), flush=True)
 
-    # Ensure module directory is in path for imports
-    if module_dir not in sys.path:
-        sys.path.insert(0, module_dir)
+    def log(msg: str):
+        """Log to stderr (doesn't interfere with JSON protocol on stdout)."""
+        print(f"[GGUF Worker] {msg}", file=sys.stderr, flush=True)
 
-    try:
-        print("[GGUF Worker] Importing torch...", flush=True)
-        import torch
-        print("[GGUF Worker] Importing llama_cpp...", flush=True)
-        from llama_cpp import Llama
-        from llama_cpp.llama_chat_format import Llava15ChatHandler
-        from PIL import Image
-        print("[GGUF Worker] Imports complete", flush=True)
-    except Exception as e:
-        print(f"[GGUF Worker] Import error: {e}", flush=True)
-        traceback.print_exc()
-        result_queue.put({"status": "init_error", "error": f"Import failed: {e}"})
-        return
+    log("Process started")
 
     if torch.cuda.is_available():
         torch.backends.cudnn.benchmark = True
@@ -54,10 +49,17 @@ def _worker_main(cmd_queue: mp.Queue, result_queue: mp.Queue, model_path: str, m
     chat_handler = None
 
     try:
-        # Load model
-        print(f"[GGUF Worker] Loading CLIP model from {mmproj_path}...", flush=True)
+        model_path = config["model_path"]
+        mmproj_path = config["mmproj_path"]
+        n_ctx = config["n_ctx"]
+        n_batch = config["n_batch"]
+        n_threads = config["n_threads"]
+        n_gpu_layers = config["n_gpu_layers"]
+
+        log(f"Loading CLIP model from {mmproj_path}...")
         chat_handler = Llava15ChatHandler(clip_model_path=mmproj_path)
-        print("[GGUF Worker] CLIP loaded, loading LLM...", flush=True)
+
+        log(f"Loading LLM from {model_path}...")
         model = Llama(
             model_path=model_path,
             n_ctx=n_ctx,
@@ -69,21 +71,25 @@ def _worker_main(cmd_queue: mp.Queue, result_queue: mp.Queue, model_path: str, m
             offload_kqv=True,
             numa=True
         )
-        print("[GGUF Worker] LLM loaded successfully", flush=True)
+        log("Models loaded successfully")
 
         # Signal ready
-        print("[GGUF Worker] Sending ready signal...", flush=True)
-        result_queue.put({"status": "ready"})
-        print("[GGUF Worker] Ready signal sent, entering main loop", flush=True)
+        send_response({"status": "ready"})
 
-        # Process loop
-        while True:
-            try:
-                cmd = cmd_queue.get(timeout=1.0)
-            except:
+        # Process loop - read JSON commands from stdin
+        for line in sys.stdin:
+            line = line.strip()
+            if not line:
                 continue
 
-            if cmd is None or cmd.get("action") == "stop":
+            try:
+                cmd = json.loads(line)
+            except json.JSONDecodeError as e:
+                send_response({"status": "error", "error": f"Invalid JSON: {e}"})
+                continue
+
+            if cmd.get("action") == "stop":
+                log("Received stop command")
                 break
 
             if cmd.get("action") == "generate":
@@ -95,7 +101,8 @@ def _worker_main(cmd_queue: mp.Queue, result_queue: mp.Queue, model_path: str, m
                         image = image.convert('RGB')
 
                     # Resize
-                    image = image.resize(cmd.get("image_size", (384, 384)), Image.Resampling.BILINEAR)
+                    image_size = tuple(cmd.get("image_size", [384, 384]))
+                    image = image.resize(image_size, Image.Resampling.BILINEAR)
 
                     # Encode for llava
                     img_buffer = io.BytesIO()
@@ -134,86 +141,138 @@ def _worker_main(cmd_queue: mp.Queue, result_queue: mp.Queue, model_path: str, m
                     response = model.create_chat_completion(**completion_params)
                     result = response["choices"][0]["message"]["content"].strip()
 
-                    result_queue.put({"status": "success", "result": result})
+                    send_response({"status": "success", "result": result})
 
                     # Cleanup intermediate
                     del messages, response, img_buffer
                     gc.collect()
 
                 except Exception as e:
-                    result_queue.put({"status": "error", "error": str(e)})
+                    log(f"Generation error: {e}")
+                    send_response({"status": "error", "error": str(e)})
 
             elif cmd.get("action") == "ping":
-                result_queue.put({"status": "pong"})
+                send_response({"status": "pong"})
 
     except Exception as e:
-        print(f"[GGUF Worker] Fatal error: {e}", flush=True)
-        traceback.print_exc()
-        try:
-            result_queue.put({"status": "init_error", "error": str(e)})
-        except:
-            pass
+        log(f"Fatal error: {e}")
+        import traceback
+        traceback.print_exc(file=sys.stderr)
+        send_response({"status": "init_error", "error": str(e)})
 
     finally:
-        print("[GGUF Worker] Shutting down...", flush=True)
-        # Cleanup (though process termination will clean everything anyway)
+        log("Shutting down...")
         if model is not None:
             try:
                 model.close()
             except:
                 pass
         gc.collect()
-        print("[GGUF Worker] Process exit", flush=True)
+        log("Process exit")
 
 
 class GGUFWorkerProcess:
     """
-    Manages GGUF model in isolated subprocess.
+    Manages GGUF model in isolated subprocess using Popen.
     Guarantees 100% memory release when cleanup() is called by terminating the process.
     """
 
     def __init__(self, model_path: str, mmproj_path: str, n_ctx: int, n_batch: int,
-                 n_threads: int, n_gpu_layers: int, timeout: float = 120.0):
+                 n_threads: int, n_gpu_layers: int, timeout: float = 180.0):
+        import subprocess
+
         self.timeout = timeout
         self._process = None
-        self._cmd_queue = None
-        self._result_queue = None
 
-        # Use spawn to ensure clean CUDA state
-        ctx = mp.get_context('spawn')
-        self._cmd_queue = ctx.Queue()
-        self._result_queue = ctx.Queue()
+        # Config to pass to worker
+        config = {
+            "model_path": model_path,
+            "mmproj_path": mmproj_path,
+            "n_ctx": n_ctx,
+            "n_batch": n_batch,
+            "n_threads": n_threads,
+            "n_gpu_layers": n_gpu_layers
+        }
 
-        self._process = ctx.Process(
-            target=_worker_main,
-            args=(self._cmd_queue, self._result_queue, model_path, mmproj_path,
-                  n_ctx, n_batch, n_threads, n_gpu_layers, _MODULE_DIR),
-            daemon=True
+        # Get path to this module
+        worker_script = Path(__file__).resolve()
+
+        # Start subprocess
+        print(f"[JoyCaption GGUF] Starting worker subprocess...")
+        self._process = subprocess.Popen(
+            [sys.executable, str(worker_script), json.dumps(config)],
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            bufsize=1  # Line buffered
         )
-        self._process.start()
 
         # Wait for ready signal
         try:
-            print(f"[JoyCaption GGUF] Waiting for worker ready signal (timeout={timeout}s)...")
-            result = self._result_queue.get(timeout=timeout)
-            print(f"[JoyCaption GGUF] Worker response: {result}")
-            if result.get("status") == "init_error":
-                raise RuntimeError(f"Worker init failed: {result.get('error')}")
-            if result.get("status") != "ready":
-                raise RuntimeError(f"Unexpected worker status: {result}")
+            print(f"[JoyCaption GGUF] Waiting for worker ready signal...")
+            response = self._read_response(timeout=timeout)
+            if response is None:
+                raise RuntimeError("No response from worker")
+            if response.get("status") == "init_error":
+                raise RuntimeError(f"Worker init failed: {response.get('error')}")
+            if response.get("status") != "ready":
+                raise RuntimeError(f"Unexpected worker status: {response}")
+            print(f"[JoyCaption GGUF] Worker ready")
         except Exception as e:
+            # Read stderr for more info
+            stderr_output = ""
+            if self._process and self._process.stderr:
+                try:
+                    import select
+                    if select.select([self._process.stderr], [], [], 0.1)[0]:
+                        stderr_output = self._process.stderr.read()
+                except:
+                    pass
             print(f"[JoyCaption GGUF] Worker startup error: {e}")
+            if stderr_output:
+                print(f"[JoyCaption GGUF] Worker stderr: {stderr_output}")
             self.cleanup()
             raise RuntimeError(f"Worker failed to start: {e}")
+
+    def _read_response(self, timeout: float = None) -> dict:
+        """Read JSON response from worker stdout."""
+        import select
+
+        if self._process is None or self._process.stdout is None:
+            return None
+
+        timeout = timeout or self.timeout
+
+        # Wait for data with timeout
+        ready, _, _ = select.select([self._process.stdout], [], [], timeout)
+        if not ready:
+            return None
+
+        line = self._process.stdout.readline()
+        if not line:
+            return None
+
+        try:
+            return json.loads(line.strip())
+        except json.JSONDecodeError:
+            return None
+
+    def _send_command(self, cmd: dict):
+        """Send JSON command to worker stdin."""
+        if self._process is None or self._process.stdin is None:
+            raise RuntimeError("Worker process is not running")
+        self._process.stdin.write(json.dumps(cmd) + "\n")
+        self._process.stdin.flush()
 
     def generate(self, image_b64: str, system: str, prompt: str,
                  max_new_tokens: int, temperature: float, top_p: float, top_k: int,
                  image_size: tuple = (384, 384)) -> str:
         """Send generation request to worker process."""
-        if self._process is None or not self._process.is_alive():
+        if not self.is_alive():
             raise RuntimeError("Worker process is not running")
 
-        self._cmd_queue.put({
+        self._send_command({
             "action": "generate",
             "image_b64": image_b64,
             "system": system,
@@ -222,63 +281,77 @@ class GGUFWorkerProcess:
             "temperature": temperature,
             "top_p": top_p,
             "top_k": top_k,
-            "image_size": image_size
+            "image_size": list(image_size)
         })
 
-        try:
-            result = self._result_queue.get(timeout=self.timeout)
-            if result.get("status") == "error":
-                return f"Generation error: {result.get('error')}"
-            return result.get("result", "")
-        except Exception as e:
-            return f"Worker communication error: {e}"
+        response = self._read_response(timeout=self.timeout)
+        if response is None:
+            return "Error: No response from worker"
+        if response.get("status") == "error":
+            return f"Generation error: {response.get('error')}"
+        return response.get("result", "")
 
     def is_alive(self) -> bool:
-        return self._process is not None and self._process.is_alive()
+        return self._process is not None and self._process.poll() is None
 
     def cleanup(self):
         """
         Terminate worker process - guarantees 100% memory release.
         OS will free ALL process memory including leaked CUDA memory.
         """
-        had_process = self._process is not None
+        if self._process is None:
+            return
 
-        if self._process is not None:
-            try:
-                # Try graceful shutdown first
-                if self._process.is_alive() and self._cmd_queue is not None:
-                    try:
-                        self._cmd_queue.put({"action": "stop"}, timeout=1.0)
-                    except:
-                        pass
-                    self._process.join(timeout=2.0)
-
-                # Force kill if still alive
-                if self._process.is_alive():
-                    self._process.terminate()
-                    self._process.join(timeout=2.0)
-
-                # Last resort
-                if self._process.is_alive():
-                    self._process.kill()
-                    self._process.join(timeout=1.0)
-            except:
-                pass
-            finally:
-                self._process = None
-
-        # Close queues
-        for q in [self._cmd_queue, self._result_queue]:
-            if q is not None:
+        try:
+            # Try graceful shutdown first
+            if self.is_alive():
                 try:
-                    q.close()
-                    q.join_thread()
+                    self._send_command({"action": "stop"})
+                    self._process.wait(timeout=2.0)
                 except:
                     pass
 
-        self._cmd_queue = None
-        self._result_queue = None
+            # Force kill if still alive
+            if self.is_alive():
+                self._process.terminate()
+                try:
+                    self._process.wait(timeout=2.0)
+                except:
+                    pass
+
+            # Last resort
+            if self.is_alive():
+                self._process.kill()
+                try:
+                    self._process.wait(timeout=1.0)
+                except:
+                    pass
+
+        except:
+            pass
+        finally:
+            # Close pipes
+            for pipe in [self._process.stdin, self._process.stdout, self._process.stderr]:
+                if pipe:
+                    try:
+                        pipe.close()
+                    except:
+                        pass
+            self._process = None
 
         gc.collect()
-        if had_process:
-            print("[JoyCaption GGUF] Worker process terminated - memory fully released")
+        print("[JoyCaption GGUF] Worker process terminated - memory fully released")
+
+
+# Entry point when run as subprocess
+if __name__ == "__main__":
+    if len(sys.argv) < 2:
+        print("Usage: python gguf_worker.py <config_json>", file=sys.stderr)
+        sys.exit(1)
+
+    try:
+        config = json.loads(sys.argv[1])
+        run_worker(config)
+    except Exception as e:
+        print(json.dumps({"status": "init_error", "error": str(e)}))
+        sys.exit(1)
