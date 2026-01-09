@@ -192,11 +192,13 @@ class JC_GGUF_Models:
                 }
             ]
 
+            import random
             completion_params = {
                 "messages": messages,
                 "max_tokens": max_new_tokens,
                 "temperature": temperature,
                 "top_p": top_p,
+                "seed": random.randint(1, 2**31 - 1),  # Random seed for variety
                 "stop": ["</s>", "User:", "Assistant:", "USER:", "ASSISTANT:", "\nUser:", "\nAssistant:", "\nUSER:", "\nASSISTANT:", "ASISTANT\n", "ASISTANT:", "ASSENT", "ASSENTED"],
                 "stream": False,
                 "repeat_penalty": 1.1,

@@ -122,11 +122,13 @@ def run_worker(config: dict):
                         }
                     ]
 
+                    import random
                     completion_params = {
                         "messages": messages,
                         "max_tokens": cmd.get("max_new_tokens", 300),
                         "temperature": cmd.get("temperature", 0.5),
                         "top_p": cmd.get("top_p", 0.9),
+                        "seed": random.randint(1, 2**31 - 1),  # Random seed for variety
                         "stop": ["</s>", "User:", "Assistant:", "USER:", "ASSISTANT:",
                                 "\nUser:", "\nAssistant:", "\nUSER:", "\nASSISTANT:",
                                 "ASISTANT\n", "ASISTANT:", "ASSENT", "ASSENTED"],
