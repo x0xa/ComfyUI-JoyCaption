@@ -24,14 +24,27 @@ def _worker_main(cmd_queue: mp.Queue, result_queue: mp.Queue, model_path: str, m
     Main worker function that runs in isolated process.
     Loads model once, processes requests until told to stop.
     """
+    import traceback
+
+    print("[GGUF Worker] Process started", flush=True)
+
     # Ensure module directory is in path for imports
     if module_dir not in sys.path:
         sys.path.insert(0, module_dir)
 
-    import torch
-    from llama_cpp import Llama
-    from llama_cpp.llama_chat_format import Llava15ChatHandler
-    from PIL import Image
+    try:
+        print("[GGUF Worker] Importing torch...", flush=True)
+        import torch
+        print("[GGUF Worker] Importing llama_cpp...", flush=True)
+        from llama_cpp import Llama
+        from llama_cpp.llama_chat_format import Llava15ChatHandler
+        from PIL import Image
+        print("[GGUF Worker] Imports complete", flush=True)
+    except Exception as e:
+        print(f"[GGUF Worker] Import error: {e}", flush=True)
+        traceback.print_exc()
+        result_queue.put({"status": "init_error", "error": f"Import failed: {e}"})
+        return
 
     if torch.cuda.is_available():
         torch.backends.cudnn.benchmark = True
@@ -42,7 +55,9 @@ def _worker_main(cmd_queue: mp.Queue, result_queue: mp.Queue, model_path: str, m
 
     try:
         # Load model
+        print(f"[GGUF Worker] Loading CLIP model from {mmproj_path}...", flush=True)
         chat_handler = Llava15ChatHandler(clip_model_path=mmproj_path)
+        print("[GGUF Worker] CLIP loaded, loading LLM...", flush=True)
         model = Llama(
             model_path=model_path,
             n_ctx=n_ctx,
@@ -54,9 +69,12 @@ def _worker_main(cmd_queue: mp.Queue, result_queue: mp.Queue, model_path: str, m
             offload_kqv=True,
             numa=True
         )
+        print("[GGUF Worker] LLM loaded successfully", flush=True)
 
         # Signal ready
+        print("[GGUF Worker] Sending ready signal...", flush=True)
         result_queue.put({"status": "ready"})
+        print("[GGUF Worker] Ready signal sent, entering main loop", flush=True)
 
         # Process loop
         while True:
@@ -129,9 +147,15 @@ def _worker_main(cmd_queue: mp.Queue, result_queue: mp.Queue, model_path: str, m
                 result_queue.put({"status": "pong"})
 
     except Exception as e:
-        result_queue.put({"status": "init_error", "error": str(e)})
+        print(f"[GGUF Worker] Fatal error: {e}", flush=True)
+        traceback.print_exc()
+        try:
+            result_queue.put({"status": "init_error", "error": str(e)})
+        except:
+            pass
 
     finally:
+        print("[GGUF Worker] Shutting down...", flush=True)
         # Cleanup (though process termination will clean everything anyway)
         if model is not None:
             try:
@@ -139,6 +163,7 @@ def _worker_main(cmd_queue: mp.Queue, result_queue: mp.Queue, model_path: str, m
             except:
                 pass
         gc.collect()
+        print("[GGUF Worker] Process exit", flush=True)
 
 
 class GGUFWorkerProcess:
@@ -169,12 +194,15 @@ class GGUFWorkerProcess:
 
         # Wait for ready signal
         try:
+            print(f"[JoyCaption GGUF] Waiting for worker ready signal (timeout={timeout}s)...")
             result = self._result_queue.get(timeout=timeout)
+            print(f"[JoyCaption GGUF] Worker response: {result}")
             if result.get("status") == "init_error":
                 raise RuntimeError(f"Worker init failed: {result.get('error')}")
             if result.get("status") != "ready":
                 raise RuntimeError(f"Unexpected worker status: {result}")
         except Exception as e:
+            print(f"[JoyCaption GGUF] Worker startup error: {e}")
             self.cleanup()
             raise RuntimeError(f"Worker failed to start: {e}")
 
