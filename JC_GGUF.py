@@ -199,7 +199,7 @@ class JC_GGUF_Models:
                 "temperature": temperature,
                 "top_p": top_p,
                 "seed": random.randint(1, 2**31 - 1),  # Random seed for variety
-                "stop": ["</s>", "User:", "Assistant:", "USER:", "ASSISTANT:", "\nUser:", "\nAssistant:", "\nUSER:", "\nASSISTANT:", "ASISTANT\n", "ASISTANT:", "ASSENT", "ASSENTED"],
+                "stop": ["</s>", "User:", "Assistant:", "USER:", "ASSISTANT:", "\nUser:", "\nAssistant:", "\nUSER:", "\nASSISTANT:", "ASISTANT\n", "ASISTANT:", "ASSENT", "ASSENTED", "Aassistant"],
                 "stream": False,
                 "repeat_penalty": 1.1,
                 "mirostat_mode": 0
