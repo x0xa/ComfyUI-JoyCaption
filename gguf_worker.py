@@ -215,25 +215,22 @@ class GGUFWorkerProcess:
         # Get path to this module
         worker_script = Path(__file__).resolve()
 
-        # Start subprocess with unbuffered stdout (-u flag)
-        env = os.environ.copy()
-        env["PYTHONUNBUFFERED"] = "1"
-
+        # Start subprocess
         print(f"[JoyCaption GGUF] Starting worker subprocess...")
         self._process = subprocess.Popen(
             [sys.executable, "-u", str(worker_script), json.dumps(config)],
             stdin=subprocess.PIPE,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
-            env=env,
-            bufsize=0  # Unbuffered
+            text=True,
+            bufsize=1  # Line buffered
         )
 
         # Start stderr reader thread to see worker logs in real-time
         def read_stderr():
             try:
                 for line in self._process.stderr:
-                    print(f"[JoyCaption Worker STDERR] {line.decode('utf-8').rstrip()}")
+                    print(f"[JoyCaption Worker STDERR] {line.rstrip()}")
             except:
                 pass
 
@@ -278,8 +275,8 @@ class GGUFWorkerProcess:
             if self._process and self._process.stderr:
                 try:
                     import select
-                    if select.select([self._process.stderr.fileno()], [], [], 0.1)[0]:
-                        stderr_output = self._process.stderr.read().decode('utf-8', errors='replace')
+                    if select.select([self._process.stderr], [], [], 0.1)[0]:
+                        stderr_output = self._process.stderr.read()
                 except:
                     pass
             print(f"[JoyCaption GGUF] Worker startup error: {e}")
@@ -298,7 +295,7 @@ class GGUFWorkerProcess:
         timeout = timeout or self.timeout
 
         # Wait for data with timeout using fileno() for binary stream
-        ready, _, _ = select.select([self._process.stdout.fileno()], [], [], timeout)
+        ready, _, _ = select.select([self._process.stdout], [], [], timeout)
         if not ready:
             return None
 
@@ -306,11 +303,8 @@ class GGUFWorkerProcess:
         if not line:
             return None
 
-        # Decode bytes to string
-        line = line.decode('utf-8').strip()
-
         try:
-            return json.loads(line)
+            return json.loads(line.strip())
         except json.JSONDecodeError:
             return None
 
@@ -318,7 +312,7 @@ class GGUFWorkerProcess:
         """Send JSON command to worker stdin."""
         if self._process is None or self._process.stdin is None:
             raise RuntimeError("Worker process is not running")
-        self._process.stdin.write((json.dumps(cmd) + "\n").encode('utf-8'))
+        self._process.stdin.write(json.dumps(cmd) + "\n")
         self._process.stdin.flush()
 
     def generate(self, image_b64: str, system: str, prompt: str,
