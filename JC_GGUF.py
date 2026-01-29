@@ -11,8 +11,48 @@ import io
 import sys
 import gc
 import os
+import threading
+import time
 from huggingface_hub import hf_hub_download
 from gguf_worker import GGUFWorkerProcess
+from server import PromptServer
+
+class ProgressNotifier:
+    """Sends progress updates via WebSocket every N seconds"""
+
+    def __init__(self, message: str, interval: float = 3.0):
+        self.message = message
+        self.interval = interval
+        self.stop_event = threading.Event()
+        self.thread = None
+
+    def __enter__(self):
+        self._send()
+        self.stop_event.clear()
+        self.thread = threading.Thread(target=self._loop)
+        self.thread.daemon = True
+        self.thread.start()
+        return self
+
+    def __exit__(self, exc_type, exc_val, exc_tb):
+        self.stop_event.set()
+        if self.thread and self.thread.is_alive():
+            self.thread.join(timeout=2)
+        return False
+
+    def _send(self):
+        try:
+            if hasattr(PromptServer, 'instance') and PromptServer.instance:
+                PromptServer.instance.send_sync("progress", {
+                    "message": self.message
+                })
+                print(f"[JoyCaption GGUF] {self.message}")
+        except Exception as e:
+            print(f"[JoyCaption GGUF] Failed to send progress: {e}")
+
+    def _loop(self):
+        while not self.stop_event.wait(self.interval):
+            self._send()
 
 class ModelLoadError(Exception):
     pass
@@ -104,54 +144,85 @@ class JC_GGUF_Models:
         self.model = None
         self.chat_handler = None  # Keep separate reference for cleanup
         try:
-            models_dir = Path(folder_paths.models_dir).resolve()
-            llm_models_dir = (models_dir / "LLM" / "GGUF").resolve()
-            llm_models_dir.mkdir(parents=True, exist_ok=True)
+            with ProgressNotifier("Initializing GGUF model..."):
+                models_dir = Path(folder_paths.models_dir).resolve()
+                llm_models_dir = (models_dir / "LLM" / "GGUF").resolve()
+                llm_models_dir.mkdir(parents=True, exist_ok=True)
 
-            model_filename = Path(model).name
-            local_path = llm_models_dir / model_filename
+            with ProgressNotifier("Checking model files..."):
+                model_filename = Path(model).name
+                local_path = llm_models_dir / model_filename
 
             if not local_path.exists():
                 if "/" not in model:
                     raise ValueError("Invalid model path")
                 repo_path, filename = model.rsplit("/", 1)
-                local_path = Path(hf_hub_download(
-                    repo_id=repo_path,
-                    filename=filename,
-                    local_dir=str(llm_models_dir),
-                    local_dir_use_symlinks=False
-                )).resolve()
+                with ProgressNotifier("Downloading GGUF model..."):
+                    local_path = Path(hf_hub_download(
+                        repo_id=repo_path,
+                        filename=filename,
+                        local_dir=str(llm_models_dir),
+                        local_dir_use_symlinks=False
+                    )).resolve()
+            else:
+                with ProgressNotifier("Model file found locally"):
+                    pass
 
-            mmproj_filename = GGUF_SETTINGS["mmproj_filename"]
-            mmproj_path = llm_models_dir / mmproj_filename
+            with ProgressNotifier("Checking vision encoder..."):
+                mmproj_filename = GGUF_SETTINGS["mmproj_filename"]
+                mmproj_path = llm_models_dir / mmproj_filename
+
             if not mmproj_path.exists():
-                mmproj_path = Path(hf_hub_download(
-                    repo_id="concedo/llama-joycaption-beta-one-hf-llava-mmproj-gguf",
-                    filename=mmproj_filename,
-                    local_dir=str(llm_models_dir),
-                    local_dir_use_symlinks=False
-                )).resolve()
+                with ProgressNotifier("Downloading vision encoder..."):
+                    mmproj_path = Path(hf_hub_download(
+                        repo_id="concedo/llama-joycaption-beta-one-hf-llava-mmproj-gguf",
+                        filename=mmproj_filename,
+                        local_dir=str(llm_models_dir),
+                        local_dir_use_symlinks=False
+                    )).resolve()
+            else:
+                with ProgressNotifier("Vision encoder found locally"):
+                    pass
 
-            n_ctx = MODEL_SETTINGS["context_window"]
-            n_batch = 2048
-            n_threads = max(4, MODEL_SETTINGS["cpu_threads"])
-            if processing_mode == "Auto":
-                n_gpu_layers = -1 if torch.cuda.is_available() else 0
-            elif processing_mode == "GPU":
-                n_gpu_layers = -1
-            else:  # CPU
-                n_gpu_layers = 0
+            with ProgressNotifier("Preparing model configuration..."):
+                n_ctx = MODEL_SETTINGS["context_window"]
+                n_batch = 2048
+                n_threads = max(4, MODEL_SETTINGS["cpu_threads"])
+                if processing_mode == "Auto":
+                    n_gpu_layers = -1 if torch.cuda.is_available() else 0
+                elif processing_mode == "GPU":
+                    n_gpu_layers = -1
+                else:  # CPU
+                    n_gpu_layers = 0
 
+            # _initialize_model now handles its own progress notifications
             self.chat_handler, self.model = self._initialize_model(local_path, mmproj_path, n_ctx, n_batch, n_threads, n_gpu_layers)
 
         except Exception as e:
             raise ModelLoadError(f"Model initialization failed: {str(e)}")
 
-    @suppress_output
     def _initialize_model(self, local_path, mmproj_path, n_ctx, n_batch, n_threads, n_gpu_layers):
-        """Initialize the GGUF model with suppressed output"""
-        chat_handler = Llava15ChatHandler(clip_model_path=str(mmproj_path))
-        model = Llama(
+        """Initialize the GGUF model with progress updates"""
+        chat_handler = None
+        model = None
+
+        with ProgressNotifier("Initializing CLIP vision handler..."):
+            chat_handler = self._load_clip_handler(mmproj_path)
+
+        with ProgressNotifier("Loading LLM into memory..."):
+            model = self._load_llama_model(local_path, n_ctx, n_batch, n_threads, n_gpu_layers, chat_handler)
+
+        return chat_handler, model
+
+    @suppress_output
+    def _load_clip_handler(self, mmproj_path):
+        """Load CLIP handler with suppressed output"""
+        return Llava15ChatHandler(clip_model_path=str(mmproj_path))
+
+    @suppress_output
+    def _load_llama_model(self, local_path, n_ctx, n_batch, n_threads, n_gpu_layers, chat_handler):
+        """Load Llama model with suppressed output"""
+        return Llama(
             model_path=str(local_path),
             n_ctx=n_ctx,
             n_batch=n_batch,
@@ -162,54 +233,60 @@ class JC_GGUF_Models:
             offload_kqv=True,
             numa=True
         )
-        return chat_handler, model
 
     def generate(self, image: Image.Image, system: str, prompt: str, max_new_tokens: int, temperature: float, top_p: float, top_k: int) -> str:
         img_buffer = None
         messages = None
         response = None
         try:
-            if image.mode != 'RGB':
-                image = image.convert('RGB')
+            with ProgressNotifier("Processing image..."):
+                if image.mode != 'RGB':
+                    image = image.convert('RGB')
 
-            image = image.resize(GGUF_SETTINGS["default_image_size"], Image.Resampling.BILINEAR)
+                image = image.resize(GGUF_SETTINGS["default_image_size"], Image.Resampling.BILINEAR)
 
-            img_buffer = io.BytesIO()
-            image.save(img_buffer, format='PNG')
-            img_buffer.seek(0)
+                img_buffer = io.BytesIO()
+                image.save(img_buffer, format='PNG')
+                img_buffer.seek(0)
 
-            img_base64 = base64.b64encode(img_buffer.read()).decode('utf-8')
-            data_uri = f"data:image/png;base64,{img_base64}"
+                img_base64 = base64.b64encode(img_buffer.read()).decode('utf-8')
+                data_uri = f"data:image/png;base64,{img_base64}"
 
-            messages = [
-                {"role": "system", "content": system.strip()},
-                {
-                    "role": "user",
-                    "content": [
-                        {"type": "text", "text": prompt.strip()},
-                        {"type": "image_url", "image_url": {"url": data_uri}}
-                    ]
+            with ProgressNotifier("Preparing prompt..."):
+                messages = [
+                    {"role": "system", "content": system.strip()},
+                    {
+                        "role": "user",
+                        "content": [
+                            {"type": "text", "text": prompt.strip()},
+                            {"type": "image_url", "image_url": {"url": data_uri}}
+                        ]
+                    }
+                ]
+
+                import random
+                completion_params = {
+                    "messages": messages,
+                    "max_tokens": max_new_tokens,
+                    "temperature": temperature,
+                    "top_p": top_p,
+                    "seed": random.randint(1, 2**31 - 1),  # Random seed for variety
+                    "stop": ["</s>", "User:", "Assistant:", "USER:", "ASSISTANT:", "\nUser:", "\nAssistant:", "\nUSER:", "\nASSISTANT:", "ASISTANT\n", "ASISTANT:", "ASSENT", "ASSENTED", "Aassistant"],
+                    "stream": False,
+                    "repeat_penalty": 1.1,
+                    "mirostat_mode": 0
                 }
-            ]
 
-            import random
-            completion_params = {
-                "messages": messages,
-                "max_tokens": max_new_tokens,
-                "temperature": temperature,
-                "top_p": top_p,
-                "seed": random.randint(1, 2**31 - 1),  # Random seed for variety
-                "stop": ["</s>", "User:", "Assistant:", "USER:", "ASSISTANT:", "\nUser:", "\nAssistant:", "\nUSER:", "\nASSISTANT:", "ASISTANT\n", "ASISTANT:", "ASSENT", "ASSENTED", "Aassistant"],
-                "stream": False,
-                "repeat_penalty": 1.1,
-                "mirostat_mode": 0
-            }
+                if top_k > 0:
+                    completion_params["top_k"] = top_k
 
-            if top_k > 0:
-                completion_params["top_k"] = top_k
+            with ProgressNotifier("Generating caption..."):
+                response = self._create_completion(completion_params)
+                result = response["choices"][0]["message"]["content"].strip()
 
-            response = self._create_completion(completion_params)
-            result = response["choices"][0]["message"]["content"].strip()
+            with ProgressNotifier("Caption completed"):
+                pass
+
             return result
 
         except Exception as e:
@@ -304,54 +381,68 @@ class JC_GGUF_Models_Subprocess:
         self.image_size = tuple(GGUF_SETTINGS["default_image_size"])
 
         try:
-            models_dir = Path(folder_paths.models_dir).resolve()
-            llm_models_dir = (models_dir / "LLM" / "GGUF").resolve()
-            llm_models_dir.mkdir(parents=True, exist_ok=True)
+            with ProgressNotifier("Initializing subprocess mode..."):
+                models_dir = Path(folder_paths.models_dir).resolve()
+                llm_models_dir = (models_dir / "LLM" / "GGUF").resolve()
+                llm_models_dir.mkdir(parents=True, exist_ok=True)
 
-            model_filename = Path(model).name
-            local_path = llm_models_dir / model_filename
+            with ProgressNotifier("Checking model files..."):
+                model_filename = Path(model).name
+                local_path = llm_models_dir / model_filename
 
             if not local_path.exists():
                 if "/" not in model:
                     raise ValueError("Invalid model path")
                 repo_path, filename = model.rsplit("/", 1)
-                local_path = Path(hf_hub_download(
-                    repo_id=repo_path,
-                    filename=filename,
-                    local_dir=str(llm_models_dir),
-                    local_dir_use_symlinks=False
-                )).resolve()
+                with ProgressNotifier("Downloading GGUF model..."):
+                    local_path = Path(hf_hub_download(
+                        repo_id=repo_path,
+                        filename=filename,
+                        local_dir=str(llm_models_dir),
+                        local_dir_use_symlinks=False
+                    )).resolve()
+            else:
+                with ProgressNotifier("Model file found locally"):
+                    pass
 
-            mmproj_filename = GGUF_SETTINGS["mmproj_filename"]
-            mmproj_path = llm_models_dir / mmproj_filename
+            with ProgressNotifier("Checking vision encoder..."):
+                mmproj_filename = GGUF_SETTINGS["mmproj_filename"]
+                mmproj_path = llm_models_dir / mmproj_filename
+
             if not mmproj_path.exists():
-                mmproj_path = Path(hf_hub_download(
-                    repo_id="concedo/llama-joycaption-beta-one-hf-llava-mmproj-gguf",
-                    filename=mmproj_filename,
-                    local_dir=str(llm_models_dir),
-                    local_dir_use_symlinks=False
-                )).resolve()
+                with ProgressNotifier("Downloading vision encoder..."):
+                    mmproj_path = Path(hf_hub_download(
+                        repo_id="concedo/llama-joycaption-beta-one-hf-llava-mmproj-gguf",
+                        filename=mmproj_filename,
+                        local_dir=str(llm_models_dir),
+                        local_dir_use_symlinks=False
+                    )).resolve()
+            else:
+                with ProgressNotifier("Vision encoder found locally"):
+                    pass
 
-            n_ctx = MODEL_SETTINGS["context_window"]
-            n_batch = 2048
-            n_threads = max(4, MODEL_SETTINGS["cpu_threads"])
-            if processing_mode == "Auto":
-                n_gpu_layers = -1 if torch.cuda.is_available() else 0
-            elif processing_mode == "GPU":
-                n_gpu_layers = -1
-            else:  # CPU
-                n_gpu_layers = 0
+            with ProgressNotifier("Configuring subprocess parameters..."):
+                n_ctx = MODEL_SETTINGS["context_window"]
+                n_batch = 2048
+                n_threads = max(4, MODEL_SETTINGS["cpu_threads"])
+                if processing_mode == "Auto":
+                    n_gpu_layers = -1 if torch.cuda.is_available() else 0
+                elif processing_mode == "GPU":
+                    n_gpu_layers = -1
+                else:  # CPU
+                    n_gpu_layers = 0
 
             print("[JoyCaption GGUF] Starting subprocess worker...")
-            self.worker = GGUFWorkerProcess(
-                model_path=str(local_path),
-                mmproj_path=str(mmproj_path),
-                n_ctx=n_ctx,
-                n_batch=n_batch,
-                n_threads=n_threads,
-                n_gpu_layers=n_gpu_layers,
-                timeout=180.0
-            )
+            with ProgressNotifier("Starting isolated worker process..."):
+                self.worker = GGUFWorkerProcess(
+                    model_path=str(local_path),
+                    mmproj_path=str(mmproj_path),
+                    n_ctx=n_ctx,
+                    n_batch=n_batch,
+                    n_threads=n_threads,
+                    n_gpu_layers=n_gpu_layers,
+                    timeout=180.0
+                )
             print("[JoyCaption GGUF] Subprocess worker ready")
 
         except Exception as e:
@@ -364,26 +455,33 @@ class JC_GGUF_Models_Subprocess:
             return "Error: Worker process is not running"
 
         try:
-            if image.mode != 'RGB':
-                image = image.convert('RGB')
+            with ProgressNotifier("Encoding image for worker..."):
+                if image.mode != 'RGB':
+                    image = image.convert('RGB')
 
-            # Encode image to base64
-            img_buffer = io.BytesIO()
-            image.save(img_buffer, format='PNG')
-            img_buffer.seek(0)
-            image_b64 = base64.b64encode(img_buffer.read()).decode('utf-8')
-            img_buffer.close()
+                # Encode image to base64
+                img_buffer = io.BytesIO()
+                image.save(img_buffer, format='PNG')
+                img_buffer.seek(0)
+                image_b64 = base64.b64encode(img_buffer.read()).decode('utf-8')
+                img_buffer.close()
 
-            return self.worker.generate(
-                image_b64=image_b64,
-                system=system,
-                prompt=prompt,
-                max_new_tokens=max_new_tokens,
-                temperature=temperature,
-                top_p=top_p,
-                top_k=top_k,
-                image_size=self.image_size
-            )
+            with ProgressNotifier("Sending request to worker process..."):
+                result = self.worker.generate(
+                    image_b64=image_b64,
+                    system=system,
+                    prompt=prompt,
+                    max_new_tokens=max_new_tokens,
+                    temperature=temperature,
+                    top_p=top_p,
+                    top_k=top_k,
+                    image_size=self.image_size
+                )
+
+            with ProgressNotifier("Worker completed"):
+                pass
+
+            return result
         except Exception as e:
             return f"Generation error: {str(e)}"
 

@@ -39,7 +39,12 @@ def run_worker(config: dict):
         """Log to stderr (doesn't interfere with JSON protocol on stdout)."""
         print(f"[GGUF Worker] {msg}", file=sys.stderr, flush=True)
 
+    def send_progress(message: str):
+        """Send progress update to parent process."""
+        send_response({"status": "progress", "message": message})
+
     log("Process started")
+    send_progress("Worker process started")
 
     if torch.cuda.is_available():
         torch.backends.cudnn.benchmark = True
@@ -57,9 +62,12 @@ def run_worker(config: dict):
         n_gpu_layers = config["n_gpu_layers"]
 
         log(f"Loading CLIP model from {mmproj_path}...")
+        send_progress("Loading CLIP vision model...")
         chat_handler = Llava15ChatHandler(clip_model_path=mmproj_path)
+        send_progress("CLIP model loaded")
 
         log(f"Loading LLM from {model_path}...")
+        send_progress("Loading language model into memory...")
         model = Llama(
             model_path=model_path,
             n_ctx=n_ctx,
@@ -72,6 +80,7 @@ def run_worker(config: dict):
             numa=True
         )
         log("Models loaded successfully")
+        send_progress("Language model loaded successfully")
 
         # Signal ready
         send_response({"status": "ready"})
@@ -94,6 +103,7 @@ def run_worker(config: dict):
 
             if cmd.get("action") == "generate":
                 try:
+                    send_progress("Processing image in worker...")
                     # Decode image
                     img_bytes = base64.b64decode(cmd["image_b64"])
                     image = Image.open(io.BytesIO(img_bytes))
@@ -104,6 +114,7 @@ def run_worker(config: dict):
                     image_size = tuple(cmd.get("image_size", [384, 384]))
                     image = image.resize(image_size, Image.Resampling.BILINEAR)
 
+                    send_progress("Encoding image for model...")
                     # Encode for llava
                     img_buffer = io.BytesIO()
                     image.save(img_buffer, format='PNG')
@@ -111,6 +122,7 @@ def run_worker(config: dict):
                     img_base64 = base64.b64encode(img_buffer.read()).decode('utf-8')
                     data_uri = f"data:image/png;base64,{img_base64}"
 
+                    send_progress("Preparing prompt...")
                     messages = [
                         {"role": "system", "content": cmd["system"].strip()},
                         {
@@ -140,9 +152,11 @@ def run_worker(config: dict):
                     if cmd.get("top_k", 0) > 0:
                         completion_params["top_k"] = cmd["top_k"]
 
+                    send_progress("Generating caption with model...")
                     response = model.create_chat_completion(**completion_params)
                     result = response["choices"][0]["message"]["content"].strip()
 
+                    send_progress("Caption generation complete")
                     send_response({"status": "success", "result": result})
 
                     # Cleanup intermediate
@@ -210,17 +224,38 @@ class GGUFWorkerProcess:
             bufsize=1  # Line buffered
         )
 
-        # Wait for ready signal
+        # Wait for ready signal (may receive progress updates first)
         try:
             print(f"[JoyCaption GGUF] Waiting for worker ready signal...")
-            response = self._read_response(timeout=timeout)
-            if response is None:
-                raise RuntimeError("No response from worker")
-            if response.get("status") == "init_error":
-                raise RuntimeError(f"Worker init failed: {response.get('error')}")
-            if response.get("status") != "ready":
-                raise RuntimeError(f"Unexpected worker status: {response}")
-            print(f"[JoyCaption GGUF] Worker ready")
+            while True:
+                response = self._read_response(timeout=timeout)
+                if response is None:
+                    raise RuntimeError("No response from worker")
+
+                status = response.get("status")
+
+                # Forward progress messages during initialization
+                if status == "progress":
+                    try:
+                        from server import PromptServer
+                        if hasattr(PromptServer, 'instance') and PromptServer.instance:
+                            PromptServer.instance.send_sync("progress", {
+                                "message": response.get("message", "Initializing worker...")
+                            })
+                            print(f"[JoyCaption GGUF] Worker init: {response.get('message')}")
+                    except Exception as e:
+                        print(f"[JoyCaption GGUF] Failed to forward init progress: {e}")
+                    continue
+
+                # Handle ready/error
+                if status == "init_error":
+                    raise RuntimeError(f"Worker init failed: {response.get('error')}")
+                elif status == "ready":
+                    print(f"[JoyCaption GGUF] Worker ready")
+                    break
+                else:
+                    # Unknown status during init, continue
+                    continue
         except Exception as e:
             # Read stderr for more info
             stderr_output = ""
@@ -286,12 +321,35 @@ class GGUFWorkerProcess:
             "image_size": list(image_size)
         })
 
-        response = self._read_response(timeout=self.timeout)
-        if response is None:
-            return "Error: No response from worker"
-        if response.get("status") == "error":
-            return f"Generation error: {response.get('error')}"
-        return response.get("result", "")
+        # Read responses until we get success or error
+        while True:
+            response = self._read_response(timeout=self.timeout)
+            if response is None:
+                return "Error: No response from worker"
+
+            status = response.get("status")
+
+            # Forward progress messages to WebSocket
+            if status == "progress":
+                try:
+                    from server import PromptServer
+                    if hasattr(PromptServer, 'instance') and PromptServer.instance:
+                        PromptServer.instance.send_sync("progress", {
+                            "message": response.get("message", "Worker processing...")
+                        })
+                        print(f"[JoyCaption GGUF] Worker: {response.get('message')}")
+                except Exception as e:
+                    print(f"[JoyCaption GGUF] Failed to forward progress: {e}")
+                continue
+
+            # Handle final responses
+            if status == "error":
+                return f"Generation error: {response.get('error')}"
+            elif status == "success":
+                return response.get("result", "")
+            else:
+                # Unknown status, continue reading
+                continue
 
     def is_alive(self) -> bool:
         return self._process is not None and self._process.poll() is None
