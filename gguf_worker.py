@@ -26,9 +26,15 @@ def run_worker(config: dict):
     - Input: {"action": "generate", ...} or {"action": "stop"}
     - Output: {"status": "ready"}, {"status": "success", "result": "..."}, {"status": "error", "error": "..."}
     """
+    import torch
+    from llama_cpp import Llama
+    from llama_cpp.llama_chat_format import Llava15ChatHandler
+    from PIL import Image
+
     def send_response(data: dict):
         """Send JSON response to parent process."""
-        print(json.dumps(data), flush=True)
+        sys.stdout.write(json.dumps(data) + "\n")
+        sys.stdout.flush()
 
     def log(msg: str):
         """Log to stderr (doesn't interfere with JSON protocol on stdout)."""
@@ -40,11 +46,6 @@ def run_worker(config: dict):
 
     log("Process started")
     send_progress("Worker process started")
-
-    import torch
-    from llama_cpp import Llama
-    from llama_cpp.llama_chat_format import Llava15ChatHandler
-    from PIL import Image
 
     if torch.cuda.is_available():
         torch.backends.cudnn.benchmark = True
@@ -197,10 +198,12 @@ class GGUFWorkerProcess:
                  n_threads: int, n_gpu_layers: int, timeout: float = 180.0):
         import subprocess
         import threading
+        import queue
 
         self.timeout = timeout
         self._process = None
-        self._stderr_thread = None
+        self._stdout_queue = queue.Queue()
+        self._reader_thread = None
 
         # Config to pass to worker
         config = {
@@ -215,7 +218,7 @@ class GGUFWorkerProcess:
         # Get path to this module
         worker_script = Path(__file__).resolve()
 
-        # Start subprocess
+        # Start subprocess with unbuffered stdout
         print(f"[JoyCaption GGUF] Starting worker subprocess...")
         self._process = subprocess.Popen(
             [sys.executable, "-u", str(worker_script), json.dumps(config)],
@@ -223,10 +226,22 @@ class GGUFWorkerProcess:
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
             text=True,
-            bufsize=1  # Line buffered
+            bufsize=1
         )
 
-        # Start stderr reader thread to see worker logs in real-time
+        # Start stdout reader thread
+        def read_stdout():
+            try:
+                for line in self._process.stdout:
+                    self._stdout_queue.put(line)
+            except:
+                pass
+            self._stdout_queue.put(None)  # Signal EOF
+
+        self._reader_thread = threading.Thread(target=read_stdout, daemon=True)
+        self._reader_thread.start()
+
+        # Start stderr reader thread
         def read_stderr():
             try:
                 for line in self._process.stderr:
@@ -234,10 +249,9 @@ class GGUFWorkerProcess:
             except:
                 pass
 
-        self._stderr_thread = threading.Thread(target=read_stderr, daemon=True)
-        self._stderr_thread.start()
+        threading.Thread(target=read_stderr, daemon=True).start()
 
-        # Wait for ready signal (may receive progress updates first)
+        # Wait for ready signal
         try:
             print(f"[JoyCaption GGUF] Waiting for worker ready signal...")
             while True:
@@ -247,7 +261,6 @@ class GGUFWorkerProcess:
 
                 status = response.get("status")
 
-                # Forward progress messages during initialization
                 if status == "progress":
                     try:
                         from server import PromptServer
@@ -260,51 +273,32 @@ class GGUFWorkerProcess:
                         print(f"[JoyCaption GGUF] Failed to forward init progress: {e}")
                     continue
 
-                # Handle ready/error
                 if status == "init_error":
                     raise RuntimeError(f"Worker init failed: {response.get('error')}")
                 elif status == "ready":
                     print(f"[JoyCaption GGUF] Worker ready")
                     break
                 else:
-                    # Unknown status during init, continue
                     continue
+
         except Exception as e:
-            # Read stderr for more info
-            stderr_output = ""
-            if self._process and self._process.stderr:
-                try:
-                    import select
-                    if select.select([self._process.stderr], [], [], 0.1)[0]:
-                        stderr_output = self._process.stderr.read()
-                except:
-                    pass
             print(f"[JoyCaption GGUF] Worker startup error: {e}")
-            if stderr_output:
-                print(f"[JoyCaption GGUF] Worker stderr: {stderr_output}")
             self.cleanup()
             raise RuntimeError(f"Worker failed to start: {e}")
 
     def _read_response(self, timeout: float = None) -> dict:
-        """Read JSON response from worker stdout."""
-        import select
-
-        if self._process is None or self._process.stdout is None:
-            return None
+        """Read JSON response from worker stdout via queue."""
+        import queue as queue_module
 
         timeout = timeout or self.timeout
 
-        # Wait for data with timeout using fileno() for binary stream
-        ready, _, _ = select.select([self._process.stdout], [], [], timeout)
-        if not ready:
-            return None
-
-        line = self._process.stdout.readline()
-        if not line:
-            return None
-
         try:
+            line = self._stdout_queue.get(timeout=timeout)
+            if line is None:
+                return None
             return json.loads(line.strip())
+        except queue_module.Empty:
+            return None
         except json.JSONDecodeError:
             return None
 
@@ -342,7 +336,6 @@ class GGUFWorkerProcess:
 
             status = response.get("status")
 
-            # Forward progress messages to WebSocket
             if status == "progress":
                 try:
                     from server import PromptServer
@@ -355,13 +348,11 @@ class GGUFWorkerProcess:
                     print(f"[JoyCaption GGUF] Failed to forward progress: {e}")
                 continue
 
-            # Handle final responses
             if status == "error":
                 return f"Generation error: {response.get('error')}"
             elif status == "success":
                 return response.get("result", "")
             else:
-                # Unknown status, continue reading
                 continue
 
     def is_alive(self) -> bool:
@@ -376,7 +367,6 @@ class GGUFWorkerProcess:
             return
 
         try:
-            # Try graceful shutdown first
             if self.is_alive():
                 try:
                     self._send_command({"action": "stop"})
@@ -384,7 +374,6 @@ class GGUFWorkerProcess:
                 except:
                     pass
 
-            # Force kill if still alive
             if self.is_alive():
                 self._process.terminate()
                 try:
@@ -392,7 +381,6 @@ class GGUFWorkerProcess:
                 except:
                     pass
 
-            # Last resort
             if self.is_alive():
                 self._process.kill()
                 try:
@@ -403,7 +391,6 @@ class GGUFWorkerProcess:
         except:
             pass
         finally:
-            # Close pipes
             for pipe in [self._process.stdin, self._process.stdout, self._process.stderr]:
                 if pipe:
                     try:
