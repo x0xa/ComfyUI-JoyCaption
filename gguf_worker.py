@@ -293,23 +293,40 @@ class GGUFWorkerProcess:
     def _read_response(self, timeout: float = None) -> dict:
         """Read JSON response from worker stdout via queue."""
         import queue as queue_module
+        import time
 
         timeout = timeout or self.timeout
+        start_time = time.time()
 
-        try:
-            line = self._stdout_queue.get(timeout=timeout)
-            if line is None:
-                print("[JoyCaption GGUF] _read_response: got EOF (None)")
+        while True:
+            remaining = timeout - (time.time() - start_time)
+            if remaining <= 0:
+                print(f"[JoyCaption GGUF] _read_response: total timeout after {timeout}s")
                 return None
-            stripped = line.strip()
-            print(f"[JoyCaption GGUF] _read_response: got line: {stripped[:200]}...")
-            return json.loads(stripped)
-        except queue_module.Empty:
-            print(f"[JoyCaption GGUF] _read_response: queue timeout after {timeout}s")
-            return None
-        except json.JSONDecodeError as e:
-            print(f"[JoyCaption GGUF] _read_response: JSON error: {e}, line: {line[:200] if line else 'None'}")
-            return None
+
+            try:
+                line = self._stdout_queue.get(timeout=remaining)
+                if line is None:
+                    print("[JoyCaption GGUF] _read_response: got EOF (None)")
+                    return None
+
+                stripped = line.strip()
+                if not stripped:
+                    continue
+
+                # Try to parse as JSON
+                try:
+                    result = json.loads(stripped)
+                    print(f"[JoyCaption GGUF] _read_response: parsed JSON with status={result.get('status')}")
+                    return result
+                except json.JSONDecodeError:
+                    # Skip non-JSON output from llama_cpp (like "encoding image slice...")
+                    print(f"[JoyCaption GGUF] _read_response: skipping non-JSON: {stripped[:100]}")
+                    continue
+
+            except queue_module.Empty:
+                print(f"[JoyCaption GGUF] _read_response: queue timeout")
+                return None
 
     def _send_command(self, cmd: dict):
         """Send JSON command to worker stdin."""
