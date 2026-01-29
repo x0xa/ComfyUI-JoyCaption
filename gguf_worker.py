@@ -26,11 +26,6 @@ def run_worker(config: dict):
     - Input: {"action": "generate", ...} or {"action": "stop"}
     - Output: {"status": "ready"}, {"status": "success", "result": "..."}, {"status": "error", "error": "..."}
     """
-    import torch
-    from llama_cpp import Llama
-    from llama_cpp.llama_chat_format import Llava15ChatHandler
-    from PIL import Image
-
     def send_response(data: dict):
         """Send JSON response to parent process."""
         print(json.dumps(data), flush=True)
@@ -43,8 +38,26 @@ def run_worker(config: dict):
         """Send progress update to parent process."""
         send_response({"status": "progress", "message": message})
 
-    log("Process started")
-    send_progress("Worker process started")
+    log("Process started, beginning imports...")
+    send_progress("Worker process started, importing modules...")
+
+    log("Importing torch...")
+    import torch
+    log("torch imported successfully")
+
+    log("Importing llama_cpp.Llama...")
+    from llama_cpp import Llama
+    log("Llama imported successfully")
+
+    log("Importing Llava15ChatHandler...")
+    from llama_cpp.llama_chat_format import Llava15ChatHandler
+    log("Llava15ChatHandler imported successfully")
+
+    log("Importing PIL.Image...")
+    from PIL import Image
+    log("All imports completed successfully")
+
+    send_progress("All modules imported")
 
     if torch.cuda.is_available():
         torch.backends.cudnn.benchmark = True
@@ -196,9 +209,11 @@ class GGUFWorkerProcess:
     def __init__(self, model_path: str, mmproj_path: str, n_ctx: int, n_batch: int,
                  n_threads: int, n_gpu_layers: int, timeout: float = 180.0):
         import subprocess
+        import threading
 
         self.timeout = timeout
         self._process = None
+        self._stderr_thread = None
 
         # Config to pass to worker
         config = {
@@ -223,6 +238,17 @@ class GGUFWorkerProcess:
             text=True,
             bufsize=1  # Line buffered
         )
+
+        # Start stderr reader thread to see worker logs in real-time
+        def read_stderr():
+            try:
+                for line in self._process.stderr:
+                    print(f"[JoyCaption Worker STDERR] {line.rstrip()}")
+            except:
+                pass
+
+        self._stderr_thread = threading.Thread(target=read_stderr, daemon=True)
+        self._stderr_thread.start()
 
         # Wait for ready signal (may receive progress updates first)
         try:
