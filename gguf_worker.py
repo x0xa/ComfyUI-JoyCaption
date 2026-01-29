@@ -10,7 +10,11 @@ import io
 import json
 import base64
 import gc
+import time
 from pathlib import Path
+
+_last_progress_time = 0
+_progress_throttle_interval = 5.0
 
 # Suppress output during import
 os.environ['TRANSFORMERS_VERBOSITY'] = 'error'
@@ -266,15 +270,19 @@ class GGUFWorkerProcess:
                 status = response.get("status")
 
                 if status == "progress":
-                    try:
-                        from server import PromptServer
-                        if hasattr(PromptServer, 'instance') and PromptServer.instance:
-                            PromptServer.instance.send_sync("progress", {
-                                "message": response.get("message", "Initializing worker...")
-                            })
-                            print(f"[JoyCaption GGUF] Worker init: {response.get('message')}")
-                    except Exception as e:
-                        print(f"[JoyCaption GGUF] Failed to forward init progress: {e}")
+                    global _last_progress_time
+                    current_time = time.time()
+                    if current_time - _last_progress_time >= _progress_throttle_interval:
+                        try:
+                            from server import PromptServer
+                            if hasattr(PromptServer, 'instance') and PromptServer.instance:
+                                PromptServer.instance.send_sync("progress", {
+                                    "message": response.get("message", "Initializing worker...")
+                                })
+                                _last_progress_time = current_time
+                                print(f"[JoyCaption GGUF] Worker init: {response.get('message')}")
+                        except Exception as e:
+                            print(f"[JoyCaption GGUF] Failed to forward init progress: {e}")
                     continue
 
                 if status == "init_error":
@@ -363,15 +371,19 @@ class GGUFWorkerProcess:
             status = response.get("status")
 
             if status == "progress":
-                try:
-                    from server import PromptServer
-                    if hasattr(PromptServer, 'instance') and PromptServer.instance:
-                        PromptServer.instance.send_sync("progress", {
-                            "message": response.get("message", "Worker processing...")
-                        })
-                        print(f"[JoyCaption GGUF] Worker: {response.get('message')}")
-                except Exception as e:
-                    print(f"[JoyCaption GGUF] Failed to forward progress: {e}")
+                global _last_progress_time
+                current_time = time.time()
+                if current_time - _last_progress_time >= _progress_throttle_interval:
+                    try:
+                        from server import PromptServer
+                        if hasattr(PromptServer, 'instance') and PromptServer.instance:
+                            PromptServer.instance.send_sync("progress", {
+                                "message": response.get("message", "Worker processing...")
+                            })
+                            _last_progress_time = current_time
+                            print(f"[JoyCaption GGUF] Worker: {response.get('message')}")
+                    except Exception as e:
+                        print(f"[JoyCaption GGUF] Failed to forward progress: {e}")
                 continue
 
             if status == "error":

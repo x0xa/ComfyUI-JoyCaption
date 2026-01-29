@@ -17,6 +17,9 @@ from huggingface_hub import hf_hub_download
 from gguf_worker import GGUFWorkerProcess
 from server import PromptServer
 
+_last_progress_time = 0
+_progress_throttle_interval = 5.0
+
 class ProgressNotifier:
     """Sends progress updates via WebSocket every N seconds"""
 
@@ -41,11 +44,16 @@ class ProgressNotifier:
         return False
 
     def _send(self):
+        global _last_progress_time
+        current_time = time.time()
+        if current_time - _last_progress_time < _progress_throttle_interval:
+            return
         try:
             if hasattr(PromptServer, 'instance') and PromptServer.instance:
                 PromptServer.instance.send_sync("progress", {
                     "message": self.message
                 })
+                _last_progress_time = current_time
                 print(f"[JoyCaption GGUF] {self.message}")
         except Exception as e:
             print(f"[JoyCaption GGUF] Failed to send progress: {e}")
