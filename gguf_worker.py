@@ -157,8 +157,11 @@ def run_worker(config: dict):
                     response = model.create_chat_completion(**completion_params)
                     result = response["choices"][0]["message"]["content"].strip()
 
+                    log(f"Generation complete, result length: {len(result)}")
                     send_progress("Caption generation complete")
+                    log("Sending success response...")
                     send_response({"status": "success", "result": result})
+                    log("Success response sent")
 
                     # Cleanup intermediate
                     del messages, response, img_buffer
@@ -234,8 +237,9 @@ class GGUFWorkerProcess:
             try:
                 for line in self._process.stdout:
                     self._stdout_queue.put(line)
-            except:
-                pass
+                print("[JoyCaption GGUF] Reader thread: stdout EOF reached")
+            except Exception as e:
+                print(f"[JoyCaption GGUF] Reader thread: exception: {e}")
             self._stdout_queue.put(None)  # Signal EOF
 
         self._reader_thread = threading.Thread(target=read_stdout, daemon=True)
@@ -295,11 +299,16 @@ class GGUFWorkerProcess:
         try:
             line = self._stdout_queue.get(timeout=timeout)
             if line is None:
+                print("[JoyCaption GGUF] _read_response: got EOF (None)")
                 return None
-            return json.loads(line.strip())
+            stripped = line.strip()
+            print(f"[JoyCaption GGUF] _read_response: got line: {stripped[:200]}...")
+            return json.loads(stripped)
         except queue_module.Empty:
+            print(f"[JoyCaption GGUF] _read_response: queue timeout after {timeout}s")
             return None
-        except json.JSONDecodeError:
+        except json.JSONDecodeError as e:
+            print(f"[JoyCaption GGUF] _read_response: JSON error: {e}, line: {line[:200] if line else 'None'}")
             return None
 
     def _send_command(self, cmd: dict):
