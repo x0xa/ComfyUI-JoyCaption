@@ -359,7 +359,17 @@ class JC:
                     self.current_memory_mode = quantization
                     self.current_model = model
                 except Exception as e:
-                    return (f"Error loading model: {e}",)
+                    detail = str(e)
+                    lowered = detail.lower()
+                    if "out of memory" in lowered or "cuda" in lowered:
+                        hint = "CUDA out of memory / GPU error"
+                    elif "401" in detail or "403" in detail or "auth" in lowered or "token" in lowered:
+                        hint = "HuggingFace auth error"
+                    elif "no space" in lowered or "disk" in lowered:
+                        hint = "no disk space"
+                    else:
+                        hint = type(e).__name__
+                    return (f"Error loading model {model_name} ({hint}): {detail}",)
 
             prompt = build_prompt(prompt_style, caption_length, extra_options[0] if extra_options else [], extra_options[1] if extra_options else "{NAME}")
             system_prompt = MODEL_SETTINGS["default_system_prompt"]
