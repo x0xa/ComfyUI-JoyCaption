@@ -297,8 +297,8 @@ class JC_GGUF_Models:
 
             return result
 
-        except Exception as e:
-            return f"Generation error: {str(e)}"
+        except Exception:
+            raise
         finally:
             # Clean up intermediate data to prevent memory buildup
             if img_buffer is not None:
@@ -460,7 +460,7 @@ class JC_GGUF_Models_Subprocess:
     def generate(self, image: Image.Image, system: str, prompt: str, max_new_tokens: int,
                  temperature: float, top_p: float, top_k: int) -> str:
         if self.worker is None or not self.worker.is_alive():
-            return "Error: Worker process is not running"
+            raise RuntimeError("Worker process is not running")
 
         try:
             with ProgressNotifier("Encoding image for worker..."):
@@ -490,8 +490,8 @@ class JC_GGUF_Models_Subprocess:
                 pass
 
             return result
-        except Exception as e:
-            return f"Generation error: {str(e)}"
+        except Exception:
+            raise
 
     def cleanup(self):
         """Terminate subprocess - guarantees 100% memory release."""
@@ -568,8 +568,8 @@ class JC_GGUF:
                         if cache_enabled:
                             _MODEL_CACHE[cache_key] = self.predictor
                             print(f"[JoyCaption GGUF] Model cached: {cache_key}")
-                    except Exception as e:
-                        return (f"Error loading model: {e}",)
+                    except Exception:
+                        raise
 
                 self.current_processing_mode = processing_mode
                 self.current_model = model
@@ -679,8 +679,8 @@ class JC_GGUF_adv:
                         if cache_enabled:
                             _MODEL_CACHE[cache_key] = self.predictor
                             print(f"[JoyCaption GGUF] Model cached: {cache_key}")
-                    except Exception as e:
-                        return ("", f"Error loading model: {e}")
+                    except Exception:
+                        raise
 
                 self.current_processing_mode = processing_mode
                 self.current_model = model
@@ -714,7 +714,7 @@ class JC_GGUF_adv:
                 self.predictor = None
                 self.current_processing_mode = None
                 self.current_model = None
-            return ("", f"Error: {str(e)}")
+            raise
 
 NODE_CLASS_MAPPINGS = {
     "JC_GGUF": JC_GGUF,
