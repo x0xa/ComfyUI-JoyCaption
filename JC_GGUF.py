@@ -118,6 +118,22 @@ else:
 
 _MODEL_CACHE = {}
 
+def free_comfy_vram(reason=""):
+    try:
+      import comfy.model_management as mm
+      mm.unload_all_models()
+      mm.soft_empty_cache(force=True)
+    except Exception as e:
+      print(f"[JoyCaption GGUF] Could not unload ComfyUI models: {e}")
+    gc.collect()
+    if torch.cuda.is_available():
+      try:
+          torch.cuda.empty_cache()
+          torch.cuda.synchronize()
+      except Exception:
+          pass
+    print(f"[JoyCaption GGUF] Freed ComfyUI VRAM before loading model{(' (' + reason + ')') if reason else ''}")
+
 def clear_model_cache():
     """Clears all cached GGUF models and frees memory."""
     global _MODEL_CACHE
@@ -202,6 +218,10 @@ class JC_GGUF_Models:
                     n_gpu_layers = -1
                 else:  # CPU
                     n_gpu_layers = 0
+
+                if n_gpu_layers != 0 and torch.cuda.is_available():
+                    with ProgressNotifier("Freeing ComfyUI VRAM..."):
+                        free_comfy_vram("in-process loader")
 
             # _initialize_model now handles its own progress notifications
             self.chat_handler, self.model = self._initialize_model(local_path, mmproj_path, n_ctx, n_batch, n_threads, n_gpu_layers)
@@ -439,6 +459,10 @@ class JC_GGUF_Models_Subprocess:
                     n_gpu_layers = -1
                 else:  # CPU
                     n_gpu_layers = 0
+
+                if n_gpu_layers != 0 and torch.cuda.is_available():
+                    with ProgressNotifier("Freeing ComfyUI VRAM..."):
+                        free_comfy_vram("subprocess loader")
 
             print("[JoyCaption GGUF] Starting subprocess worker...")
             with ProgressNotifier("Starting isolated worker process..."):
