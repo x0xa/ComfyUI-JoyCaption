@@ -3,6 +3,7 @@ from pathlib import Path
 import torch
 import numpy as np
 from PIL import Image, ImageOps
+from comfy_execution.graph_utils import ExecutionBlocker
 
 class ImageBatchPath:
     @classmethod
@@ -52,6 +53,8 @@ class ImageBatchPath:
 
         if skip_captioned:
             image_files = [f for f in image_files if not self.has_non_empty_caption(image_dir, f, caption_ext)]
+            if not image_files:
+                return ([ExecutionBlocker(None)], [ExecutionBlocker(None)])
 
         if sort_method == "sequential":
             image_files.sort()
