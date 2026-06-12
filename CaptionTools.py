@@ -12,7 +12,9 @@ class ImageBatchPath:
             "optional": {
                 "batch_size": ("INT", {"default": 0, "min": 0, "step": 1, "tooltip": "Number of images to load (0 = all images)"}),
                 "start_from": ("INT", {"default": 1, "min": 1, "step": 1, "tooltip": "Start from Nth image (1 = first image)"}),
-                "sort_method": (["sequential", "reverse", "random"], {"default": "sequential", "tooltip": "Image loading order: sequential/reverse/random"})
+                "sort_method": (["sequential", "reverse", "random"], {"default": "sequential", "tooltip": "Image loading order: sequential/reverse/random"}),
+                "skip_captioned": ("BOOLEAN", {"default": False, "tooltip": "Skip images that already have a non-empty caption sidecar"}),
+                "caption_ext": ("STRING", {"default": "txt", "tooltip": "Caption sidecar extension used by skip_captioned"})
             }
         }
 
@@ -28,15 +30,28 @@ class ImageBatchPath:
             return float("NaN")
         return hash(frozenset(kwargs))
 
-    def load_image_batch(self, image_dir: str, batch_size: int = 0, start_from: int = 1, sort_method: str = "sequential"):
+    def has_non_empty_caption(self, image_dir: str, image_filename: str, caption_ext: str) -> bool:
+        normalized_ext = caption_ext.lower().lstrip('.')
+        caption_filename = f"{os.path.splitext(image_filename)[0]}.{normalized_ext}".lower()
+        entries_by_lower_name = {entry.lower(): entry for entry in os.listdir(image_dir)}
+        actual_name = entries_by_lower_name.get(caption_filename)
+        if actual_name is None:
+            return False
+        with open(os.path.join(image_dir, actual_name), 'r', encoding='utf-8') as caption_file:
+            return caption_file.read().strip() != ""
+
+    def load_image_batch(self, image_dir: str, batch_size: int = 0, start_from: int = 1, sort_method: str = "sequential", skip_captioned: bool = False, caption_ext: str = "txt"):
         if not os.path.isdir(image_dir):
             raise FileNotFoundError(f"Directory '{image_dir}' cannot be found.")
-            
+
         valid_extensions = ['.jpg', '.jpeg', '.png', '.webp']
         image_files = [f for f in os.listdir(image_dir) if any(f.lower().endswith(ext) for ext in valid_extensions)]
-        
+
         if not image_files:
             raise FileNotFoundError(f"No valid images found in '{image_dir}'.")
+
+        if skip_captioned:
+            image_files = [f for f in image_files if not self.has_non_empty_caption(image_dir, f, caption_ext)]
 
         if sort_method == "sequential":
             image_files.sort()
