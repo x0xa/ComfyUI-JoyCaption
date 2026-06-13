@@ -4,6 +4,7 @@ import folder_paths
 from pathlib import Path
 from PIL import Image
 from torchvision.transforms import ToPILImage
+from caption_sanitize import sanitize_caption
 import json
 import gc
 import os
@@ -274,7 +275,7 @@ class JC_Models:
 
             generate_ids = generate_ids[inputs['input_ids'].shape[1]:]
             caption = self.processor.tokenizer.decode(generate_ids, skip_special_tokens=True, clean_up_tokenization_spaces=False)
-            return caption.strip()
+            return sanitize_caption(caption)
         finally:
             # Clean up intermediate tensors to prevent memory leaks
             if inputs is not None:

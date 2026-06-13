@@ -12,6 +12,7 @@ import base64
 import gc
 import time
 from pathlib import Path
+from caption_sanitize import sanitize_caption
 
 _last_progress_time = 0
 _progress_throttle_interval = 5.0
@@ -159,7 +160,7 @@ def run_worker(config: dict):
 
                     send_progress("Generating caption with model...")
                     response = model.create_chat_completion(**completion_params)
-                    result = response["choices"][0]["message"]["content"].strip()
+                    result = sanitize_caption(response["choices"][0]["message"]["content"])
 
                     log(f"Generation complete, result length: {len(result)}")
                     send_progress("Caption generation complete")

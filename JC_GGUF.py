@@ -15,6 +15,7 @@ import threading
 import time
 from huggingface_hub import hf_hub_download
 from gguf_worker import GGUFWorkerProcess
+from caption_sanitize import sanitize_caption
 from server import PromptServer
 
 _last_progress_time = 0
@@ -310,7 +311,7 @@ class JC_GGUF_Models:
 
             with ProgressNotifier("Generating caption..."):
                 response = self._create_completion(completion_params)
-                result = response["choices"][0]["message"]["content"].strip()
+                result = sanitize_caption(response["choices"][0]["message"]["content"])
 
             with ProgressNotifier("Caption completed"):
                 pass
