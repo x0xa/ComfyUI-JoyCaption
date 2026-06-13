@@ -13,7 +13,7 @@ import gc
 import time
 from pathlib import Path
 from caption_sanitize import sanitize_caption
-from image_utils import fit_pad_square
+from image_utils import fit_contain
 
 _last_progress_time = 0
 _progress_throttle_interval = 5.0
@@ -34,7 +34,7 @@ def run_worker(config: dict):
     """
     import torch
     from llama_cpp import Llama
-    from llama_cpp.llama_chat_format import Llava15ChatHandler
+    from llama_cpp.llama_chat_format import Qwen25VLChatHandler
     from PIL import Image
 
     def send_response(data: dict):
@@ -70,7 +70,7 @@ def run_worker(config: dict):
 
         log(f"Loading CLIP model from {mmproj_path}...")
         send_progress("Loading CLIP vision model...")
-        chat_handler = Llava15ChatHandler(clip_model_path=mmproj_path)
+        chat_handler = Qwen25VLChatHandler(clip_model_path=mmproj_path)
         send_progress("CLIP model loaded")
 
         log(f"Loading LLM from {model_path}...")
@@ -117,9 +117,8 @@ def run_worker(config: dict):
                     if image.mode != 'RGB':
                         image = image.convert('RGB')
 
-                    # Resize (aspect-preserving fit + pad to the encoder's native square)
-                    image_size = tuple(cmd.get("image_size", [384, 384]))
-                    image = fit_pad_square(image, image_size[0])
+                    # Resize aspect-preserving so the long side matches the encoder size
+                    image = fit_contain(image, int(cmd.get("image_size", 1024)))
 
                     send_progress("Encoding image for model...")
                     # Encode for llava
@@ -148,9 +147,7 @@ def run_worker(config: dict):
                         "temperature": cmd.get("temperature", 0.5),
                         "top_p": cmd.get("top_p", 0.9),
                         "seed": random.randint(1, 2**31 - 1),  # Random seed for variety
-                        "stop": ["</s>", "User:", "Assistant:", "USER:", "ASSISTANT:",
-                                "\nUser:", "\nAssistant:", "\nUSER:", "\nASSISTANT:",
-                                "ASISTANT\n", "ASISTANT:", "ASSENT", "ASSENTED"],
+                        "stop": ["</s>", "User:", "Assistant:", "USER:", "ASSISTANT:"],
                         "stream": False,
                         "repeat_penalty": 1.1,
                         "mirostat_mode": 0
@@ -228,7 +225,7 @@ class GGUFWorkerProcess:
         worker_script = Path(__file__).resolve()
 
         # Start subprocess with unbuffered stdout
-        print(f"[JoyCaption GGUF] Starting worker subprocess...")
+        print(f"[QwenCaption GGUF] Starting worker subprocess...")
         self._process = subprocess.Popen(
             [sys.executable, "-u", str(worker_script), json.dumps(config)],
             stdin=subprocess.PIPE,
@@ -243,9 +240,9 @@ class GGUFWorkerProcess:
             try:
                 for line in self._process.stdout:
                     self._stdout_queue.put(line)
-                print("[JoyCaption GGUF] Reader thread: stdout EOF reached")
+                print("[QwenCaption GGUF] Reader thread: stdout EOF reached")
             except Exception as e:
-                print(f"[JoyCaption GGUF] Reader thread: exception: {e}")
+                print(f"[QwenCaption GGUF] Reader thread: exception: {e}")
             self._stdout_queue.put(None)  # Signal EOF
 
         self._reader_thread = threading.Thread(target=read_stdout, daemon=True)
@@ -255,7 +252,7 @@ class GGUFWorkerProcess:
         def read_stderr():
             try:
                 for line in self._process.stderr:
-                    print(f"[JoyCaption Worker STDERR] {line.rstrip()}")
+                    print(f"[QwenCaption Worker STDERR] {line.rstrip()}")
             except:
                 pass
 
@@ -263,7 +260,7 @@ class GGUFWorkerProcess:
 
         # Wait for ready signal
         try:
-            print(f"[JoyCaption GGUF] Waiting for worker ready signal...")
+            print(f"[QwenCaption GGUF] Waiting for worker ready signal...")
             while True:
                 response = self._read_response(timeout=timeout)
                 if response is None:
@@ -282,21 +279,21 @@ class GGUFWorkerProcess:
                                     "message": response.get("message", "Initializing worker...")
                                 })
                                 _last_progress_time = current_time
-                                print(f"[JoyCaption GGUF] Worker init: {response.get('message')}")
+                                print(f"[QwenCaption GGUF] Worker init: {response.get('message')}")
                         except Exception as e:
-                            print(f"[JoyCaption GGUF] Failed to forward init progress: {e}")
+                            print(f"[QwenCaption GGUF] Failed to forward init progress: {e}")
                     continue
 
                 if status == "init_error":
                     raise RuntimeError(f"Worker init failed: {response.get('error')}")
                 elif status == "ready":
-                    print(f"[JoyCaption GGUF] Worker ready")
+                    print(f"[QwenCaption GGUF] Worker ready")
                     break
                 else:
                     continue
 
         except Exception as e:
-            print(f"[JoyCaption GGUF] Worker startup error: {e}")
+            print(f"[QwenCaption GGUF] Worker startup error: {e}")
             self.cleanup()
             raise RuntimeError(f"Worker failed to start: {e}")
 
@@ -311,13 +308,13 @@ class GGUFWorkerProcess:
         while True:
             remaining = timeout - (time.time() - start_time)
             if remaining <= 0:
-                print(f"[JoyCaption GGUF] _read_response: total timeout after {timeout}s")
+                print(f"[QwenCaption GGUF] _read_response: total timeout after {timeout}s")
                 return None
 
             try:
                 line = self._stdout_queue.get(timeout=remaining)
                 if line is None:
-                    print("[JoyCaption GGUF] _read_response: got EOF (None)")
+                    print("[QwenCaption GGUF] _read_response: got EOF (None)")
                     return None
 
                 stripped = line.strip()
@@ -327,15 +324,15 @@ class GGUFWorkerProcess:
                 # Try to parse as JSON
                 try:
                     result = json.loads(stripped)
-                    print(f"[JoyCaption GGUF] _read_response: parsed JSON with status={result.get('status')}")
+                    print(f"[QwenCaption GGUF] _read_response: parsed JSON with status={result.get('status')}")
                     return result
                 except json.JSONDecodeError:
                     # Skip non-JSON output from llama_cpp (like "encoding image slice...")
-                    print(f"[JoyCaption GGUF] _read_response: skipping non-JSON: {stripped[:100]}")
+                    print(f"[QwenCaption GGUF] _read_response: skipping non-JSON: {stripped[:100]}")
                     continue
 
             except queue_module.Empty:
-                print(f"[JoyCaption GGUF] _read_response: queue timeout")
+                print(f"[QwenCaption GGUF] _read_response: queue timeout")
                 return None
 
     def _send_command(self, cmd: dict):
@@ -347,7 +344,7 @@ class GGUFWorkerProcess:
 
     def generate(self, image_b64: str, system: str, prompt: str,
                  max_new_tokens: int, temperature: float, top_p: float, top_k: int,
-                 image_size: tuple = (384, 384)) -> str:
+                 image_size: int = 1024) -> str:
         """Send generation request to worker process."""
         if not self.is_alive():
             raise RuntimeError("Worker process is not running")
@@ -361,7 +358,7 @@ class GGUFWorkerProcess:
             "temperature": temperature,
             "top_p": top_p,
             "top_k": top_k,
-            "image_size": list(image_size)
+            "image_size": int(image_size)
         })
 
         # Read responses until we get success or error
@@ -383,9 +380,9 @@ class GGUFWorkerProcess:
                                 "message": response.get("message", "Worker processing...")
                             })
                             _last_progress_time = current_time
-                            print(f"[JoyCaption GGUF] Worker: {response.get('message')}")
+                            print(f"[QwenCaption GGUF] Worker: {response.get('message')}")
                     except Exception as e:
-                        print(f"[JoyCaption GGUF] Failed to forward progress: {e}")
+                        print(f"[QwenCaption GGUF] Failed to forward progress: {e}")
                 continue
 
             if status == "error":
@@ -440,7 +437,7 @@ class GGUFWorkerProcess:
             self._process = None
 
         gc.collect()
-        print("[JoyCaption GGUF] Worker process terminated - memory fully released")
+        print("[QwenCaption GGUF] Worker process terminated - memory fully released")
 
 
 # Entry point when run as subprocess
