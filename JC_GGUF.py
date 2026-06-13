@@ -16,6 +16,7 @@ import time
 from huggingface_hub import hf_hub_download
 from gguf_worker import GGUFWorkerProcess
 from caption_sanitize import sanitize_caption
+from image_utils import fit_pad_square
 from server import PromptServer
 
 _last_progress_time = 0
@@ -272,7 +273,7 @@ class JC_GGUF_Models:
                 if image.mode != 'RGB':
                     image = image.convert('RGB')
 
-                image = image.resize(GGUF_SETTINGS["default_image_size"], Image.Resampling.BILINEAR)
+                image = fit_pad_square(image, GGUF_SETTINGS["default_image_size"][0])
 
                 img_buffer = io.BytesIO()
                 image.save(img_buffer, format='PNG')

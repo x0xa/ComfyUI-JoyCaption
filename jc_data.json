@@ -243,7 +243,7 @@
     },
     "gguf_settings": {
         "mmproj_filename": "llama-joycaption-beta-one-llava-mmproj-model-f16.gguf",
-        "default_image_size": [336, 336]
+        "default_image_size": [384, 384]
     },
     "hf_models": {
         "joycaption-beta-one-fp8": {

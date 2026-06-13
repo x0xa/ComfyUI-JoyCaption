@@ -13,6 +13,7 @@ import gc
 import time
 from pathlib import Path
 from caption_sanitize import sanitize_caption
+from image_utils import fit_pad_square
 
 _last_progress_time = 0
 _progress_throttle_interval = 5.0
@@ -116,9 +117,9 @@ def run_worker(config: dict):
                     if image.mode != 'RGB':
                         image = image.convert('RGB')
 
-                    # Resize
+                    # Resize (aspect-preserving fit + pad to the encoder's native square)
                     image_size = tuple(cmd.get("image_size", [384, 384]))
-                    image = image.resize(image_size, Image.Resampling.BILINEAR)
+                    image = fit_pad_square(image, image_size[0])
 
                     send_progress("Encoding image for model...")
                     # Encode for llava
